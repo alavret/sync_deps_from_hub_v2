@@ -1,0 +1,16 @@
+aiohttp
+aiosignal==1.2.0
+async-timeout==4.0.2
+attrs==21.4.0
+certifi==2021.10.8
+charset-normalizer==2.0.12
+frozenlist
+idna==3.3
+multidict
+python-dateutil==2.8.2
+requests
+six==1.16.0
+urllib3==1.26.9
+yarl
+python-dotenv
+datetime

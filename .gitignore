@@ -1,0 +1,6 @@
+/.DS_Store
+/.env.bak
+/.env_ldap.bak
+/.vscode
+/sync_deps.log
+/virtenv
