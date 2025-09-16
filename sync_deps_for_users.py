@@ -58,19 +58,18 @@ def build_group_hierarchy():
         for item in conn.entries:
             entry = {}
             if item['objectCategory'].value.startswith('CN=Person'):
-                if item['mail'].value is not None:
-                    if len(item['mail'].value.strip()) > 0:
-                        ex14 = ''
-                        if len(item.entry_attributes_as_dict.get('extensionAttribute14','')) > 0:
-                            ex14 = item.entry_attributes_as_dict.get('extensionAttribute14','')[0].lower().strip()
-                        entry['mail'] = item['mail'].value.lower().strip()                        
-                        entry['extensionAttribute14'] = ex14
-                        if item['displayName'].value is not None:
-                            entry['displayName'] = item['displayName'].value.lower().strip()
-                        else:
-                            entry['displayName'] = item['cn'].value.lower().strip() 
+                if len(item.entry_attributes_as_dict.get('mail','')) > 0:
+                    ex14 = ''
+                    if len(item.entry_attributes_as_dict.get('extensionAttribute14','')) > 0:
+                        ex14 = item.entry_attributes_as_dict.get('extensionAttribute14','')[0].lower().strip()
+                    entry['mail'] = item['mail'].value.lower().strip()                        
+                    entry['extensionAttribute14'] = ex14
+                    if item['displayName'].value is not None:
+                        entry['displayName'] = item['displayName'].value.lower().strip()
+                    else:
+                        entry['displayName'] = item['cn'].value.lower().strip() 
 
-                        users.append(entry)
+                    users.append(entry)
 
     except Exception as e:
         logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
@@ -119,7 +118,9 @@ def build_group_hierarchy():
 
 def build_hierarcy_recursive(conn, ldap_base_dn, attrib_list, base, item, hierarchy, all_dn, users):
 
+    logger.info(f"ldap_base_dn - {ldap_base_dn}")
     ldap_search_filter = f"(memberOf={item['distinguishedName'].value})"
+    logger.info(f"LDAP filter - {ldap_search_filter}")
     conn.search(ldap_base_dn, ldap_search_filter, search_scope=SUBTREE, attributes=['*', '+'])
 
     try:            
@@ -127,11 +128,8 @@ def build_hierarcy_recursive(conn, ldap_base_dn, attrib_list, base, item, hierar
             if item['objectCategory'].value.startswith("CN=Group"):
                 all_dn.append(item['distinguishedName'].value)
                 sam_name = item['sAMAccountName'].value.lower().strip()
-                if item['mail'].value is None:
-                    group_mail = ''
-                else:
-                    group_mail = item['mail'].value
-                    #group_mail = f"{item['sAMAccountName'].value}@{EMAIL_DOMAIN}"
+                group_mail = item.entry_attributes_as_dict.get('mail','')
+                #group_mail = f"{item['sAMAccountName'].value}@{EMAIL_DOMAIN}"
                 if len(item.entry_attributes_as_dict.get('displayName','')) > 0:
                     hierarchy.append(f"{base};{item['displayName'].value}~{group_mail}")
                     previuos = f"{base};{item['displayName'].value}"
