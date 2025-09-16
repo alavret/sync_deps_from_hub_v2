@@ -33,8 +33,8 @@ def build_group_hierarchy():
     ldap_user = os.environ.get('LDAP_USER')
     ldap_password = os.environ.get('LDAP_PASSWORD')
     ldap_base_dn = os.environ.get('LDAP_BASE_DN')
-    #ldap_search_filter = os.environ.get('LDAP_SEARCH_FILTER')
-    ldap_search_filter = f"(memberOf={os.environ.get('HAB_ROOT_GROUP')})"
+    ldap_search_filter = os.environ.get('LDAP_SEARCH_FILTER')
+    #ldap_search_filter = f"(memberOf={os.environ.get('HAB_ROOT_GROUP')})"
 
     attrib_list = list(os.environ.get('ATTRIB_LIST').split(','))
     out_file = os.environ.get('AD_DEPS_OUT_FILE')
@@ -47,38 +47,68 @@ def build_group_hierarchy():
         logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
         return []
             
-    conn.search(ldap_base_dn, ldap_search_filter, search_scope=SUBTREE, attributes=attrib_list)
+    users = []
+    conn.search(ldap_base_dn, ldap_search_filter, search_scope=SUBTREE, attributes=['*', '+'])
     if conn.last_error is not None:
-        logger.error(f'Can not connect to LDAP. Exit.')
+        logger.error('Can not connect to LDAP. Exit.')
+        #logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
+        return {}
+
+    try:            
+        for item in conn.entries:
+            entry = {}
+            if item['objectCategory'].value.startswith('CN=Person'):
+                if item['mail'].value is not None:
+                    if len(item['mail'].value.strip()) > 0:
+                        ex14 = ''
+                        if len(item.entry_attributes_as_dict.get('extensionAttribute14','')) > 0:
+                            ex14 = item.entry_attributes_as_dict.get('extensionAttribute14','')[0].lower().strip()
+                        entry['mail'] = item['mail'].value.lower().strip()                        
+                        entry['extensionAttribute14'] = ex14
+                        if item['displayName'].value is not None:
+                            entry['displayName'] = item['displayName'].value.lower().strip()
+                        else:
+                            entry['displayName'] = item['cn'].value.lower().strip() 
+
+                        users.append(entry)
+
+    except Exception as e:
         logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
-        return []
+        return {}
 
     hierarchy = []
     all_dn = []
     root_group_search_filter = f"(distinguishedName={os.environ.get('HAB_ROOT_GROUP')})"
-    conn.search(ldap_base_dn, root_group_search_filter, search_scope=SUBTREE, attributes=attrib_list)
+    conn.search(ldap_base_dn, root_group_search_filter, search_scope=SUBTREE, attributes=['*', '+'])
     if conn.last_error is not None:
-        logger.error(f'Can not connect to LDAP. Exit.')
-        logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
+        logger.error('Can not connect to LDAP. Exit.')
+        #logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
         return []
     if len(conn.entries) == 0:
-        logger.error(f'Can find root group. Exit.')
+        logger.error('Can find root group. Exit.')
         return []
-
-    if conn.entries[0]['displayName'].value is not None:
+    
+    item = conn.entries[0]
+    if len(item.entry_attributes_as_dict.get('displayName','')) > 0:
         name = conn.entries[0]['displayName'].value
     else:
         name = conn.entries[0]['cn'].value
 
-    if conn.entries[0]['mail'].value is not None:
+    if len(item.entry_attributes_as_dict.get('mail','')) > 0:
         email = conn.entries[0]['mail'].value
     else:
         email = ''
 
     hierarchy.append(f"{name}~{email}")
-    root_group_name = conn.entries[0]['displayName'].value
-    sam_name = conn.entries[0]['sAMAccountName'].value
-    hierarchy, all_dn = build_hierarcy_recursive(conn, ldap_base_dn, attrib_list, root_group_name, conn.entries[0], hierarchy, all_dn, sam_name)
+    root_group_name = name
+    if len(item.entry_attributes_as_dict.get('sAMAccountName','')) > 0:
+        sam_name = conn.entries[0]['sAMAccountName'].value.lower().strip()
+        for user in users:
+            if len(user["extensionAttribute14"]) > 0:
+                if user["extensionAttribute14"] == sam_name:
+                    hierarchy.append(f"{root_group_name}|{user['displayName']};{user['mail']}")
+
+    hierarchy, all_dn = build_hierarcy_recursive(conn, ldap_base_dn, attrib_list, root_group_name, conn.entries[0], hierarchy, all_dn, users)
         
     if out_file:
         with open(out_file, "w", encoding="utf-8") as f:
@@ -87,35 +117,35 @@ def build_group_hierarchy():
 
     return hierarchy, all_dn
 
-def build_hierarcy_recursive(conn, ldap_base_dn, attrib_list, base, item, hierarchy, all_dn, sam_name):
+def build_hierarcy_recursive(conn, ldap_base_dn, attrib_list, base, item, hierarchy, all_dn, users):
 
     ldap_search_filter = f"(memberOf={item['distinguishedName'].value})"
-    conn.search(ldap_base_dn, ldap_search_filter, search_scope=SUBTREE, attributes=attrib_list)
+    conn.search(ldap_base_dn, ldap_search_filter, search_scope=SUBTREE, attributes=['*', '+'])
 
     try:            
         for item in conn.entries:            
             if item['objectCategory'].value.startswith("CN=Group"):
                 all_dn.append(item['distinguishedName'].value)
+                sam_name = item['sAMAccountName'].value.lower().strip()
                 if item['mail'].value is None:
                     group_mail = ''
                 else:
-                    group_mail = f"{item['sAMAccountName'].value}@{EMAIL_DOMAIN}"
-                if item['displayName'].value is not None:
+                    group_mail = item['mail'].value
+                    #group_mail = f"{item['sAMAccountName'].value}@{EMAIL_DOMAIN}"
+                if len(item.entry_attributes_as_dict.get('displayName','')) > 0:
                     hierarchy.append(f"{base};{item['displayName'].value}~{group_mail}")
                     previuos = f"{base};{item['displayName'].value}"
                 else:
                     hierarchy.append(f"{base};{item['cn'].value}~{group_mail}")
                     previuos = f"{base};{item['cn'].value}"
                 
-                hierarchy, all_dn = build_hierarcy_recursive(conn, ldap_base_dn, attrib_list, previuos, item, hierarchy, all_dn, item['sAMAccountName'].value)
-            elif item['objectCategory'].value.startswith("CN=Person"):
-                if item['extensionAttribute4'].value is not None:
-                    if item['extensionAttribute4'].value.lower() == sam_name.lower():
-                        if item['mail'].value is not None:
-                            if item['displayName'].value is not None:
-                                hierarchy.append(f"{base}|{item['displayName'].value};{item['mail'].value}")
-                            else:
-                                hierarchy.append(f"{base}|{item['cn'].value};{item['mail'].value}")
+                for user in users:
+                    if len(user["extensionAttribute14"]) > 0:
+                        if user["extensionAttribute14"] == sam_name:
+                            hierarchy.append(f"{previuos}|{user['displayName']};{user['mail']}")
+
+                hierarchy, all_dn = build_hierarcy_recursive(conn, ldap_base_dn, attrib_list, previuos, item, hierarchy, all_dn, users)
+
 
     except Exception as e:
         logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
@@ -285,7 +315,7 @@ def assign_users_to_deps(created_deps, y360_users, ad_users):
         found_user_dep_id = ''
         found_user = None
         for y360_user in y360_users:
-            if y360_user['nickname'] == alias:
+            if y360_user['nickname'].lower() == alias:
                 found_id = y360_user['id']
                 found_user_dep_id = y360_user['departmentId']
                 found_user = y360_user
@@ -294,7 +324,7 @@ def assign_users_to_deps(created_deps, y360_users, ad_users):
             for y360_user in y360_users:
                 for contact in y360_user['contacts']:
                     if contact['type'] == 'email':
-                        if contact['value'].split('@')[0] == alias:
+                        if contact['value'].split('@')[0].lower() == alias:
                             found_id = y360_user['id']
                             found_user_dep_id = y360_user['departmentId']
                             found_user = y360_user

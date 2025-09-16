@@ -110,10 +110,9 @@ class API360:
         """
         response = requests.post(f"{self.url}/departments", json=department_info, headers=self.headers)
         if response.status_code == 200:
-            print(f"Department {department_info['name']} was created successfully")
+            return True, f"Department {department_info['name']} was created successfully"
         else:
-            print(
-                f"During creating Department {department_info['name']} occurred error: {response.content.decode(encoding='UTF-8')}")
+            return False, f"During creating Department {department_info['name']} occurred error: {response.content.decode(encoding='UTF-8')}"
 
     def get_groups_list(self):
         """
