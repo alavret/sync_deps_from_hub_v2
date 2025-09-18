@@ -1,7 +1,7 @@
 import os
 from dotenv import load_dotenv
 from datetime import datetime
-from ldap3 import Server, Connection, ALL, SUBTREE, ALL_ATTRIBUTES, Tls, MODIFY_REPLACE, set_config_parameter
+from ldap3 import Server, Connection, ALL, SUBTREE, ALL_ATTRIBUTES, Tls, MODIFY_REPLACE, set_config_parameter, utils
 from ldap3.core.exceptions import LDAPBindError
 from lib.y360_api.api_script import API360
 import logging
@@ -36,7 +36,8 @@ def build_group_hierarchy():
     ldap_search_filter = os.environ.get('LDAP_SEARCH_FILTER')
     #ldap_search_filter = f"(memberOf={os.environ.get('HAB_ROOT_GROUP')})"
 
-    attrib_list = list(os.environ.get('ATTRIB_LIST').split(','))
+    #attrib_list = list(os.environ.get('ATTRIB_LIST').split(','))
+    attrib_list = ['*', '+']
     out_file = os.environ.get('AD_DEPS_OUT_FILE')
 
     server = Server(ldap_host, port=ldap_port, get_info=ALL) 
@@ -48,7 +49,7 @@ def build_group_hierarchy():
         return []
             
     users = []
-    conn.search(ldap_base_dn, ldap_search_filter, search_scope=SUBTREE, attributes=['*', '+'])
+    conn.search(ldap_base_dn, ldap_search_filter, search_scope=SUBTREE, attributes=attrib_list)
     if conn.last_error is not None:
         logger.error('Can not connect to LDAP. Exit.')
         #logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
@@ -78,7 +79,7 @@ def build_group_hierarchy():
     hierarchy = []
     all_dn = []
     root_group_search_filter = f"(distinguishedName={os.environ.get('HAB_ROOT_GROUP')})"
-    conn.search(ldap_base_dn, root_group_search_filter, search_scope=SUBTREE, attributes=['*', '+'])
+    conn.search(ldap_base_dn, root_group_search_filter, search_scope=SUBTREE, attributes=attrib_list)
     if conn.last_error is not None:
         logger.error('Can not connect to LDAP. Exit.')
         #logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
@@ -119,9 +120,9 @@ def build_group_hierarchy():
 def build_hierarcy_recursive(conn, ldap_base_dn, attrib_list, base, item, hierarchy, all_dn, users):
 
     logger.info(f"ldap_base_dn - {ldap_base_dn}")
-    ldap_search_filter = f"(memberOf={item['distinguishedName'].value})"
+    ldap_search_filter = f"(memberOf={utils.conv.escape_filter_chars(item['distinguishedName'].value)})"
     logger.info(f"LDAP filter - {ldap_search_filter}")
-    conn.search(ldap_base_dn, ldap_search_filter, search_scope=SUBTREE, attributes=['*', '+'])
+    conn.search(ldap_base_dn, ldap_search_filter, search_scope=SUBTREE, attributes=attrib_list)
 
     try:            
         for item in conn.entries:            
@@ -249,9 +250,14 @@ def create_dep_from_prepared_list(deps_list, max_levels):
         for item in deps_to_add:
             # Ищем в списке департаментов в 360 конкретное значение
             #d = next(i for i in all_deps_from_api if i['name'] == item['current'] and i['parentId'] == item['prevId'])
-            d = next(i for i in api_prepared_list if i['path'] == item['path'])
+            #if not dry_run:
+            for target in api_prepared_list:
+                if target['path'] == item['path']:
+                    item['360id'] = target['id']
+                    break
+            #d = next(i for i in api_prepared_list if i['path'] == item['path'])
             #Обновляем информацию в final_list для записанных в 360 департаментов
-            item['360id'] = d['id']
+            
     
     return deps_list, api_prepared_list
 
@@ -342,7 +348,7 @@ def assign_users_to_deps(created_deps, y360_users, ad_users):
                                         "departmentId": deps['360id'],
                                     })
                         else:
-                            logger.info(f"Dry run: department of {user['email']} user will be changed from _ {found_user_dep_id} _ to _ {deps['360id']} _")
+                            logger.info(f"Dry run: department of {user.split('|')[1].split(';')[1]} user will be changed from _ {found_user_dep_id} _ to _ {deps['path']} _")
                     break
         else:
             logger.info(f"AD User {user.split('|')[1]} not found in Y360.")
@@ -405,9 +411,10 @@ if __name__ == "__main__":
     created_deps, deps_from_y360 = create_dep_from_prepared_list(final_list,max_levels)
     for item in created_deps:
         if item['360id'] == 0:
-            logger.error('\n')
-            logger.error('Not all departments from Active Directory were saved in Yandex 360. Fix errors. Exit.\n')
-            sys.exit(1)
+            if not dry_run:
+                logger.error('\n')
+                logger.error('Not all departments from Active Directory were saved in Yandex 360. Fix errors. Exit.\n')
+                sys.exit(1)
     y360_users = organization.get_all_users()
     if not y360_users:
         logger.error('\n')
