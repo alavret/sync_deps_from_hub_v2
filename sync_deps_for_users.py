@@ -94,12 +94,13 @@ def build_group_hierarchy():
     else:
         name = conn.entries[0]['cn'].value
 
-    if len(item.entry_attributes_as_dict.get('mail','')) > 0:
-        email = conn.entries[0]['mail'].value.lower().strip().replace("[","").replace("]","").replace("'","")     
+    raw_mail = item.entry_attributes_as_dict.get('mail','')
+    if isinstance(raw_mail, list):
+        group_mail = raw_mail[0].lower().strip()
     else:
-        email = ''
+        group_mail = raw_mail.value.lower().strip()
 
-    hierarchy.append(f"{name}~{email}")
+    hierarchy.append(f"{name}~{group_mail}")
     root_group_name = name
     if len(item.entry_attributes_as_dict.get('sAMAccountName','')) > 0:
         sam_name = conn.entries[0]['sAMAccountName'].value.lower().strip()
@@ -128,7 +129,12 @@ def build_hierarcy_recursive(conn, ldap_base_dn, attrib_list, base, item, hierar
             if item['objectCategory'].value.startswith("CN=Group"):
                 all_dn.append(item['distinguishedName'].value)
                 sam_name = item['sAMAccountName'].value.lower().strip()
-                group_mail = item.entry_attributes_as_dict.get('mail','').lower().strip().replace("[","").replace("]","").replace("'","")     
+                raw_mail = item.entry_attributes_as_dict.get('mail','')
+                if isinstance(raw_mail, list):
+                    group_mail = raw_mail[0].lower().strip()
+                else:
+                    group_mail = raw_mail.value.lower().strip()
+                 
                 #group_mail = f"{item['sAMAccountName'].value}@{EMAIL_DOMAIN}"
                 if len(item.entry_attributes_as_dict.get('displayName','')) > 0:
                     hierarchy.append(f"{base};{item['displayName'].value}~{group_mail}")
