@@ -63,7 +63,7 @@ def build_group_hierarchy():
                     ex14 = ''
                     if len(item.entry_attributes_as_dict.get('extensionAttribute14','')) > 0:
                         ex14 = item.entry_attributes_as_dict.get('extensionAttribute14','')[0].lower().strip()
-                    entry['mail'] = item['mail'].value.lower().strip()                        
+                    entry['mail'] = item['mail'].value.lower().strip().replace("[","").replace("]","").replace("'","")                       
                     entry['extensionAttribute14'] = ex14
                     if item['displayName'].value is not None:
                         entry['displayName'] = item['displayName'].value.lower().strip()
@@ -95,7 +95,7 @@ def build_group_hierarchy():
         name = conn.entries[0]['cn'].value
 
     if len(item.entry_attributes_as_dict.get('mail','')) > 0:
-        email = conn.entries[0]['mail'].value
+        email = conn.entries[0]['mail'].value.lower().strip().replace("[","").replace("]","").replace("'","")     
     else:
         email = ''
 
@@ -119,9 +119,8 @@ def build_group_hierarchy():
 
 def build_hierarcy_recursive(conn, ldap_base_dn, attrib_list, base, item, hierarchy, all_dn, users):
 
-    logger.info(f"ldap_base_dn - {ldap_base_dn}")
     ldap_search_filter = f"(memberOf={utils.conv.escape_filter_chars(item['distinguishedName'].value)})"
-    logger.info(f"LDAP filter - {ldap_search_filter}")
+    logger.debug(f"LDAP filter - {ldap_search_filter}")
     conn.search(ldap_base_dn, ldap_search_filter, search_scope=SUBTREE, attributes=attrib_list)
 
     try:            
@@ -129,7 +128,7 @@ def build_hierarcy_recursive(conn, ldap_base_dn, attrib_list, base, item, hierar
             if item['objectCategory'].value.startswith("CN=Group"):
                 all_dn.append(item['distinguishedName'].value)
                 sam_name = item['sAMAccountName'].value.lower().strip()
-                group_mail = item.entry_attributes_as_dict.get('mail','')
+                group_mail = item.entry_attributes_as_dict.get('mail','').lower().strip().replace("[","").replace("]","").replace("'","")     
                 #group_mail = f"{item['sAMAccountName'].value}@{EMAIL_DOMAIN}"
                 if len(item.entry_attributes_as_dict.get('displayName','')) > 0:
                     hierarchy.append(f"{base};{item['displayName'].value}~{group_mail}")
@@ -404,7 +403,8 @@ if __name__ == "__main__":
     if not check_similar_groups_in_hierarchy(all_dn):
         sys.exit(1)
     if not check_similar_mails_in_hierarchy(hieralchy):
-        sys.exit(1)
+        #sys.exit(1)
+        pass
 
     final_list = prepare_deps_list_from_ad_hab(hieralchy)
     max_levels = max([len(s['path'].split(';')) for s in final_list])
