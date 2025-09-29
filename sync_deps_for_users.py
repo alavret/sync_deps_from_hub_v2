@@ -1,3 +1,4 @@
+from hmac import new
 import os
 from dotenv import load_dotenv
 from datetime import datetime
@@ -89,8 +90,8 @@ def build_group_hierarchy():
         return []
     
     item = conn.entries[0]
-    if len(item.entry_attributes_as_dict.get('displayName','')) > 0:
-        name = conn.entries[0]['displayName'].value
+    if len(item.entry_attributes_as_dict.get('description','')) > 0:
+        name = conn.entries[0]['description'].value
     else:
         name = conn.entries[0]['cn'].value
 
@@ -98,7 +99,7 @@ def build_group_hierarchy():
     if isinstance(raw_mail, list):
         group_mail = raw_mail[0].lower().strip()
     else:
-        group_mail = raw_mail.value.lower().strip()
+        group_mail = raw_mail.lower().strip()
 
     hierarchy.append(f"{name}~{group_mail}")
     root_group_name = name
@@ -133,12 +134,12 @@ def build_hierarcy_recursive(conn, ldap_base_dn, attrib_list, base, item, hierar
                 if isinstance(raw_mail, list):
                     group_mail = raw_mail[0].lower().strip()
                 else:
-                    group_mail = raw_mail.value.lower().strip()
+                    group_mail = raw_mail.lower().strip()
                  
                 #group_mail = f"{item['sAMAccountName'].value}@{EMAIL_DOMAIN}"
-                if len(item.entry_attributes_as_dict.get('displayName','')) > 0:
-                    hierarchy.append(f"{base};{item['displayName'].value}~{group_mail}")
-                    previuos = f"{base};{item['displayName'].value}"
+                if len(item.entry_attributes_as_dict.get('description','')) > 0:
+                    hierarchy.append(f"{base};{item['description'].value}~{group_mail}")
+                    previuos = f"{base};{item['description'].value}"
                 else:
                     hierarchy.append(f"{base};{item['cn'].value}~{group_mail}")
                     previuos = f"{base};{item['cn'].value}"
@@ -166,13 +167,14 @@ def generate_deps_list_from_api():
     all_deps = []
     for item in all_deps_from_api:        
         path = item['name'].strip()
+        mail = item['label'].lower()
         prevId = item['parentId']
         if prevId > 0:
             while not prevId == 1:
                 d = next(i for i in all_deps_from_api if i['id'] == prevId)
                 path = f'{d["name"].strip()};{path}'
                 prevId = d['parentId']
-            element = {'id':item['id'], 'parentId':item['parentId'], 'path':path}
+            element = {'id':item['id'], 'parentId':item['parentId'], 'path':path, 'mail':mail}
             all_deps.append(element)
     return all_deps
 
@@ -262,9 +264,7 @@ def create_dep_from_prepared_list(deps_list, max_levels):
                     break
             #d = next(i for i in api_prepared_list if i['path'] == item['path'])
             #Обновляем информацию в final_list для записанных в 360 департаментов
-            
-    
-    return deps_list, api_prepared_list
+    return deps_list
 
 
 def prepare_deps_list_from_ad_hab(hierarchy):
@@ -294,27 +294,82 @@ def prepare_deps_list_from_ad_hab(hierarchy):
     # Добавление в 360
     return deps_list
 
-def delete_deps_from_y360(created_deps, deps_from_y360, y360_users):
-    for item in deps_from_y360:
-        if item['path'] not in [d['path'] for d in created_deps]:
-            if item['id'] != 1:
-                logger.info(f"Found unused department - {item['path']}")
+def delete_deps_from_y360(created_deps, y360_users, reason):
+    temp_deps_from_y360 = generate_deps_list_from_api()
+    deps_from_y360 = sorted(temp_deps_from_y360, key=lambda x: len(x['path'].split(';')))
+    deps_from_y360.append({'id':1,'path':'All'})
+    deps_to_delete = set()
+    deps_to_change_name = []
+    if reason == "no_users":
+        for item360 in deps_from_y360:
+            if item360['path'] not in [d['path'] for d in created_deps]:
+                if item360['id'] != 1:
+                    logger.info(f"Found unused department - {item360['path']}")
+                    deps_to_delete.add(item360['id'])
+    elif reason == "same_email":
+        for item360 in deps_from_y360:
+            if item360['id'] != 1:
+                for itemAD in created_deps:
+                    if '@' in itemAD['email']:
+                        mailAD = itemAD['email'].split('@')[0]
+                    else:
+                        mailAD = itemAD['email']
+                    if len(mailAD) > 0 and len(item360['mail']) > 0:
+                        if item360['mail'] == mailAD.lower():
+                            prev360 = next(item for item in deps_from_y360 if item['id'] == item360['parentId'])['path']
+                            # Проверяем, что имя подразделения было изменено
+                            old_name = item360['path'].split(';')[-1]
+                            new_name = itemAD['path'].split(';')[-1]
+                            if old_name != new_name:
+                                if prev360 != itemAD['prev']:
+                                    deps_to_delete.add(item360['id'])
+                                else:
+                                    # Меняем имя подразделения в списке подразделений в 360
+                                    for deps in deps_from_y360:
+                                        temp_path = deps['path'].split(';')
+                                        new_path = []
+                                        for temp in temp_path:
+                                            if temp == old_name:
+                                                new_path.append(new_name)
+                                            else:
+                                                new_path.append(temp)
+                                        deps['path'] = ';'.join(new_path)
+
+                                    deps_to_change_name.append({'id':item360['id'], 'name':itemAD['path'].split(';')[-1]})
+                            break
+
+    if len(deps_to_delete) > 0:      
+        for deps_id in list(deps_to_delete):
+            deps_path = next(item for item in deps_from_y360 if item['id'] == deps_id)['path']
+            path_to_delete = [line for line in deps_from_y360 if line['path'].startswith(deps_path)]
+            sorted_paths = sorted(path_to_delete, key=lambda x: len(x['path']), reverse=True)
+            for item in sorted_paths:
+                deps_id = next(dep for dep in deps_from_y360 if dep['path'] == item['path'])['id']
                 for user in y360_users:
-                    if user['departmentId'] == item['id']:
+                    if user['departmentId'] == deps_id:
                         if not dry_run:
-                            logger.info(f"Try to change department of {user['email']} user from _ {item['path']} _ to _ All _")
+                            logger.info(f"Try to change department of {user['email']} user from _ {deps_path} _ to _ All _")
                             organization.patch_user_info(
                                     uid = user["id"],
                                     user_data={
                                         "departmentId": 1,
                                     })
                         else:
-                            logger.info(f"Dry run: department of {user['email']} user will be changed from _ {item['path']} _ to _ All _")
+                            logger.info(f"Dry run: department of {user['email']} user will be changed from _ {deps_path} _ to _ All _")
+
+                if not dry_run:
+                    logger.info(f"Try to delete department {deps_path} from Y360.")
+                    organization.delete_department_by_id(deps_id)
+                else:
+                    logger.info(f"Dry run: department {deps_path} will be deleted")
+
+    if len(deps_to_change_name) > 0:
+        for item in deps_to_change_name:
             if not dry_run:
-                logger.info(f"Try to delete department {item['path']} from Y360.")
-                organization.delete_department_by_id(item['id'])
+                logger.info(f"Try to change name of department {item['id']} to {item['name']}")
+                organization.patch_department_info(item['id'], {'name': item['name']})
             else:
-                logger.info(f"Dry run: department {item['path']} will be deleted")
+                logger.info(f"Dry run: name of department {item['id']} will be changed to {item['name']}")
 
 def assign_users_to_deps(created_deps, y360_users, ad_users):
     checked_users = []
@@ -378,6 +433,107 @@ def assign_users_to_deps(created_deps, y360_users, ad_users):
             else:
                 logger.info(f"Dry run: department of user {users_dict[id]['email']} will be changed to _ All _")
 
+def assign_users_to_deps2(created_deps, y360_users, ad_users):
+    add_to_360_aliases = []
+    add_to_360 = []
+    delete_candidates_from_360 = []
+    delete_from_360 = []
+    for deps in created_deps:
+        if deps['360id'] != 1:
+            users_360 = [user for user in y360_users if user['departmentId'] == deps['360id']]
+            emails_ad = [user.split('|')[1].split(';')[1].lower() for user in ad_users if deps['path'] == user.split('|')[0]]
+
+            for email in emails_ad:
+                if '@' in email:
+                    email = email.split('@')[0]
+                found_user = False
+                for user in users_360:
+                    aliases = [alias.lower() for alias in user['aliases']]
+                    if user['nickname'].lower() == email or email in aliases:
+                        found_user = True
+                        break
+                if not found_user:
+                    add_to_360_aliases.append({"alias":email, "departmentId":deps['360id']})
+
+            for user in users_360:
+                found_user = False
+                aliases = [alias.lower() for alias in user['aliases']]  
+                for email in emails_ad:
+                    if '@' in email:
+                        email = email.split('@')[0]
+                    if email == user['nickname'].lower() or email in aliases:
+                        found_user = True
+                        break
+                if not found_user:
+                    delete_candidates_from_360.append(user)
+
+    for data in add_to_360_aliases:
+        for user in y360_users:
+            aliases = [alias.lower() for alias in user['aliases']]  
+            if data['alias'].lower() == user['nickname'].lower() or data['alias'].lower() in aliases:
+                add_to_360.append({"user":user, "departmentId":data['departmentId']})
+                break
+    
+    for user in delete_candidates_from_360:
+        found_user = False
+        for data in add_to_360:
+            if user['id'] == data['user']['id']:
+                found_user = True
+                break
+        if not found_user:
+            delete_from_360.append(user)
+
+    for user in delete_from_360:
+        logger.info(f"Change department of user {user['email']} to _ All _")
+        if not dry_run:
+            organization.patch_user_info(
+                    uid = user['id'],
+                    user_data={
+                        "departmentId": 1,
+                    })
+        else:
+            logger.info(f"Dry run: department of user {user['email']} will be changed to _ All _")
+
+    for user in add_to_360:
+        logger.info(f"Change department of user {user['user']['email']} to {user['departmentId']}")
+        if not dry_run:
+            organization.patch_user_info(
+                    uid = user['user']['id'],
+                    user_data={
+                        "departmentId": user['departmentId'],
+                    })
+        else:
+            logger.info(f"Dry run: Change department of user {user['user']['email']} to {user['departmentId']}")
+
+def delete_deps_with_no_users():
+    all_deps_from_api = organization.get_departments_list()
+    for dep in all_deps_from_api:
+        if dep['id'] != 1:
+            if dep['membersCount'] == 0:
+                if not dry_run:
+                    logger.info(f"Try to delete department {dep['name']} from Y360.")
+                    organization.delete_department_by_id(dep['id'])
+                else:
+                    logger.info(f"Dry run: department {dep['name']} will be deleted")
+
+def filter_empty_ad_deps(hieralchy):
+    out_hieralchy = []
+    if len(hieralchy) == 0:
+        return []
+    
+    for item in hieralchy:
+        found_users = False
+        if '|' not in item:
+            compare_with = item.split('~')[0]
+            for line in hieralchy:
+                if '|' in line:
+                    if line.split('|')[0] == compare_with:
+                        found_users = True
+                        out_hieralchy.append(line)
+            if found_users:
+                out_hieralchy.append(item)
+    return out_hieralchy
+                   
 
 if __name__ == "__main__":
     denv_path = os.path.join(os.path.dirname(__file__), '.env_ldap')
@@ -402,6 +558,7 @@ if __name__ == "__main__":
         logger.info('- Режим тестового прогона включен (DRY_RUN = True)! Изменения не сохраняются! -')
 
     hieralchy, all_dn = build_group_hierarchy()
+
     if not hieralchy:
         logger.error('\n')
         logger.error('List of current departments form Active directory is empty. Exit.\n')
@@ -412,27 +569,33 @@ if __name__ == "__main__":
         #sys.exit(1)
         pass
 
+    hieralchy = filter_empty_ad_deps(hieralchy)
     final_list = prepare_deps_list_from_ad_hab(hieralchy)
+    y360_users = organization.get_all_users()
+    delete_deps_from_y360(final_list, y360_users, "same_email")
     max_levels = max([len(s['path'].split(';')) for s in final_list])
-    created_deps, deps_from_y360 = create_dep_from_prepared_list(final_list,max_levels)
+    created_deps = create_dep_from_prepared_list(final_list,max_levels)
     for item in created_deps:
         if item['360id'] == 0:
             if not dry_run:
                 logger.error('\n')
                 logger.error('Not all departments from Active Directory were saved in Yandex 360. Fix errors. Exit.\n')
                 sys.exit(1)
-    y360_users = organization.get_all_users()
+    
     if not y360_users:
         logger.error('\n')
         logger.error('List of users from Yandex 360 is empty. Exit.\n')
         sys.exit(1)
-    delete_deps_from_y360(created_deps, deps_from_y360, y360_users)
+    
     ad_users = [item for item in hieralchy if '|' in item]
     if not ad_users:
         logger.error('\n')
         logger.error('List of users from Active Directory is empty. Exit.\n')
         sys.exit(1)
-    assign_users_to_deps(created_deps, y360_users, ad_users)
+    assign_users_to_deps2(created_deps, y360_users, ad_users)
+    y360_users = organization.get_all_users()
+    delete_deps_from_y360(final_list, y360_users, "no_users")
+    delete_deps_with_no_users()
 
     logger.info('---------------End-----------------')
 

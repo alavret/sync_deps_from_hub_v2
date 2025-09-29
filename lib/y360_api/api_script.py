@@ -101,8 +101,16 @@ class API360:
     def delete_department_alias(self):
         pass
 
-    def patch_department_info(self, department_id=0):
-        pass
+    def patch_department_info(self, department_id=0, data = {}):
+        response = requests.patch(f"{self.url}/departments/{department_id}", headers=self.headers, json=data)
+    
+        try:
+            res = response.json()
+        except requests.exceptions.JSONDecodeError:
+            print(f"Error decoding response: {response}")
+        except Exception as e:
+            print(e.message)
+        return res
 
     def post_create_department(self, department_info: dict):
         """
