@@ -1,16 +1,28 @@
-from hmac import new
 import os
 from dotenv import load_dotenv
 from datetime import datetime
 from ldap3 import Server, Connection, ALL, SUBTREE, ALL_ATTRIBUTES, Tls, MODIFY_REPLACE, set_config_parameter, utils
 from ldap3.core.exceptions import LDAPBindError
-from lib.y360_api.api_script import API360
 import logging
 import logging.handlers as handlers
 import sys
+import requests
+from dataclasses import dataclass
+from http import HTTPStatus
+import time
 
 LOG_FILE = "sync_deps.log"
 EMAIL_DOMAIN = "domain.ru"
+DEFAULT_360_API_URL = "https://api360.yandex.net"
+ITEMS_PER_PAGE = 100
+MAX_RETRIES = 3
+RETRIES_DELAY_SEC = 2
+SLEEP_TIME_BETWEEN_API_CALLS = 0.5
+ALL_USERS_REFRESH_IN_MINUTES = 15
+USERS_PER_PAGE_FROM_API = 1000
+DEPARTMENTS_PER_PAGE_FROM_API = 100
+SENSITIVE_FIELDS = ['password', 'oauth_token', 'access_token', 'token']
+EXIT_CODE = 1
 
 logger = logging.getLogger("sync_deps")
 logger.setLevel(logging.DEBUG)
@@ -24,38 +36,32 @@ file_handler.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d %(levelname
 logger.addHandler(console_handler)
 logger.addHandler(file_handler)
 
-def build_group_hierarchy():
+def build_group_hierarchy(settings: "SettingParams"):
 
     set_config_parameter('DEFAULT_SERVER_ENCODING', 'utf-8')
     set_config_parameter('ADDITIONAL_SERVER_ENCODINGS', 'koi8-r')
 
-    ldap_host = os.environ.get('LDAP_HOST')
-    ldap_port = int(os.environ.get('LDAP_PORT'))
-    ldap_user = os.environ.get('LDAP_USER')
-    ldap_password = os.environ.get('LDAP_PASSWORD')
-    ldap_base_dn = os.environ.get('LDAP_BASE_DN')
-    ldap_search_filter = os.environ.get('LDAP_SEARCH_FILTER')
-    #ldap_search_filter = f"(memberOf={os.environ.get('HAB_ROOT_GROUP')})"
-
     #attrib_list = list(os.environ.get('ATTRIB_LIST').split(','))
     attrib_list = ['*', '+']
-    out_file = os.environ.get('AD_DEPS_OUT_FILE')
 
-    server = Server(ldap_host, port=ldap_port, get_info=ALL) 
+    server = Server(settings.ldap_host, port=settings.ldap_port, get_info=ALL) 
     try:
-        conn = Connection(server, user=ldap_user, password=ldap_password, auto_bind=True)
+        logger.debug(f'Trying to connect to LDAP server {settings.ldap_host}:{settings.ldap_port}')
+        conn = Connection(server, user=settings.ldap_user, password=settings.ldap_password, auto_bind=True)
     except LDAPBindError as e:
         logger.error('Can not connect to LDAP - "automatic bind not successful - invalidCredentials". Exit.')
         logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
         return []
-            
+    logger.info(f'Connected to LDAP server {settings.ldap_host}:{settings.ldap_port}')
+
     users = []
-    conn.search(ldap_base_dn, ldap_search_filter, search_scope=SUBTREE, attributes=attrib_list)
+    logger.info(f'Trying to search users. LDAP filter: {settings.ldap_search_filter}')
+    conn.search(settings.ldap_base_dn, settings.ldap_search_filter, search_scope=SUBTREE, attributes=attrib_list)
     if conn.last_error is not None:
         logger.error('Can not connect to LDAP. Exit.')
         #logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
         return {}
-
+    logger.info(f'Found {len(conn.entries)} records.')
     try:            
         for item in conn.entries:
             entry = {}
@@ -76,11 +82,13 @@ def build_group_hierarchy():
     except Exception as e:
         logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
         return {}
-
+    logger.info('All users are processed.')
+    
     hierarchy = []
     all_dn = []
-    root_group_search_filter = f"(distinguishedName={os.environ.get('HAB_ROOT_GROUP')})"
-    conn.search(ldap_base_dn, root_group_search_filter, search_scope=SUBTREE, attributes=attrib_list)
+    root_group_search_filter = f"(distinguishedName={settings.hab_root_group})"
+    logger.info(f'Trying to search root group. LDAP filter: {root_group_search_filter}')
+    conn.search(settings.ldap_base_dn, root_group_search_filter, search_scope=SUBTREE, attributes=attrib_list)
     if conn.last_error is not None:
         logger.error('Can not connect to LDAP. Exit.')
         #logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
@@ -90,8 +98,8 @@ def build_group_hierarchy():
         return []
     
     item = conn.entries[0]
-    if len(item.entry_attributes_as_dict.get('description','')) > 0:
-        name = conn.entries[0]['description'].value
+    if len(item.entry_attributes_as_dict.get('displayName','')) > 0:
+        name = conn.entries[0]['displayName'].value
     else:
         name = conn.entries[0]['cn'].value
 
@@ -100,31 +108,34 @@ def build_group_hierarchy():
         group_mail = raw_mail[0].lower().strip()
     else:
         group_mail = raw_mail.lower().strip()
-
+    logger.info(f'Root group name: {name}, group mail: {group_mail}')
     hierarchy.append(f"{name}~{group_mail}")
     root_group_name = name
+    logger.info(f'Add users to group {name}')
+    count_users = 0
     if len(item.entry_attributes_as_dict.get('sAMAccountName','')) > 0:
         sam_name = conn.entries[0]['sAMAccountName'].value.lower().strip()
         for user in users:
             if len(user["extensionAttribute14"]) > 0:
                 if user["extensionAttribute14"] == sam_name:
+                    count_users += 1
                     hierarchy.append(f"{root_group_name}|{user['displayName']};{user['mail']}")
-
-    hierarchy, all_dn = build_hierarcy_recursive(conn, ldap_base_dn, attrib_list, root_group_name, conn.entries[0], hierarchy, all_dn, users)
-        
-    if out_file:
-        with open(out_file, "w", encoding="utf-8") as f:
+    logger.info(f'Added {count_users} users to group {name}.')
+    hierarchy, all_dn = build_hierarcy_recursive(conn, settings, attrib_list, root_group_name, conn.entries[0], hierarchy, all_dn, users)
+    logger.info('AD data has been generated.')
+    if settings.ad_data_file:
+        with open(settings.ad_data_file, "w", encoding="utf-8") as f:
             for line in hierarchy:
                 f.write(f"{line}\n")
-
+    logger.info(f'AD data has been saved to file {settings.ad_data_file} ({len(hierarchy)} lines).')
     return hierarchy, all_dn
 
-def build_hierarcy_recursive(conn, ldap_base_dn, attrib_list, base, item, hierarchy, all_dn, users):
+def build_hierarcy_recursive(conn, settings: "SettingParams", attrib_list, base, item, hierarchy, all_dn, users):
 
     ldap_search_filter = f"(memberOf={utils.conv.escape_filter_chars(item['distinguishedName'].value)})"
-    logger.debug(f"LDAP filter - {ldap_search_filter}")
-    conn.search(ldap_base_dn, ldap_search_filter, search_scope=SUBTREE, attributes=attrib_list)
-
+    logger.info(f'Trying to search members of group. LDAP filter: {ldap_search_filter}')
+    conn.search(settings.ldap_base_dn, ldap_search_filter, search_scope=SUBTREE, attributes=attrib_list)
+    logger.info(f'Found {len(conn.entries)} records.')
     try:            
         for item in conn.entries:            
             if item['objectCategory'].value.startswith("CN=Group"):
@@ -137,19 +148,22 @@ def build_hierarcy_recursive(conn, ldap_base_dn, attrib_list, base, item, hierar
                     group_mail = raw_mail.lower().strip()
                  
                 #group_mail = f"{item['sAMAccountName'].value}@{EMAIL_DOMAIN}"
-                if len(item.entry_attributes_as_dict.get('description','')) > 0:
-                    hierarchy.append(f"{base};{item['description'].value}~{group_mail}")
-                    previuos = f"{base};{item['description'].value}"
+                if len(item.entry_attributes_as_dict.get('displayName','')) > 0:
+                    hierarchy.append(f"{base};{item['displayName'].value}~{group_mail}")
+                    previuos = f"{base};{item['displayName'].value}"
                 else:
                     hierarchy.append(f"{base};{item['cn'].value}~{group_mail}")
                     previuos = f"{base};{item['cn'].value}"
-                
+                logger.info(f'Add group {item['distinguishedName'].value} to hierarchy.')
+                logger.info(f'Add users to group {item['distinguishedName'].value}')
+                count_users = 0
                 for user in users:
                     if len(user["extensionAttribute14"]) > 0:
                         if user["extensionAttribute14"] == sam_name:
+                            count_users += 1
                             hierarchy.append(f"{previuos}|{user['displayName']};{user['mail']}")
-
-                hierarchy, all_dn = build_hierarcy_recursive(conn, ldap_base_dn, attrib_list, previuos, item, hierarchy, all_dn, users)
+                logger.info(f'Added {count_users} users to group {item['distinguishedName'].value}.')
+                hierarchy, all_dn = build_hierarcy_recursive(conn, settings, attrib_list, previuos, item, hierarchy, all_dn, users)
 
 
     except Exception as e:
@@ -159,8 +173,9 @@ def build_hierarcy_recursive(conn, ldap_base_dn, attrib_list, base, item, hierar
     return hierarchy, all_dn
 
 
-def generate_deps_list_from_api():
-    all_deps_from_api = organization.get_departments_list()
+def generate_deps_list_from_api(settings: "SettingParams"):
+
+    all_deps_from_api = get_all_api360_departments(settings)
     if len(all_deps_from_api) == 1:
         #print('There are no departments in organozation! Exit.')
         return []
@@ -189,6 +204,7 @@ def load_heirarchy_from_file(file_path):
 
 def check_similar_mails_in_hierarchy(hierarchy):
     # Функция проверки наличия похожих почтовых адресов в иерархии
+    logger.info(f'Check similar mails in hierarchy. Source data has {len(hierarchy)} items.')
     count_disct = {}
     for item in hierarchy:
         if '|' in item:
@@ -200,7 +216,7 @@ def check_similar_mails_in_hierarchy(hierarchy):
 
     bad_emails = [k for k, v in count_disct.items() if v > 1]
     if len(bad_emails) > 0:
-        logger.error(f'Error! One or several AD users exist in several HAB groups.')
+        logger.error('Error! One or several AD users exist in several HAB groups.')
         for email in bad_emails:
             for item in hierarchy:
                 if '|' in item:
@@ -211,6 +227,7 @@ def check_similar_mails_in_hierarchy(hierarchy):
 
 def check_similar_groups_in_hierarchy(all_dn):
     # Функция проверки наличия похожих почтовых адресов в иерархии
+    logger.info(f'Check similar groups in hierarchy. Source data has {len(all_dn)} items.')
     all_dn.sort()
     compared_item = ''
     no_errors = True
@@ -218,15 +235,15 @@ def check_similar_groups_in_hierarchy(all_dn):
         if item != compared_item:
             compared_item = item
         else:
-            logger.error(f'Error! HAB group {compared_item} is member of several groups..')
+            logger.error(f'Error! HAB group {compared_item} is member of several groups.')
             no_errors = False
     return  no_errors
    
 
-def create_dep_from_prepared_list(deps_list, max_levels):
+def create_dep_from_prepared_list(settings: "SettingParams", deps_list, max_levels):
     # Фнункция создания департамента из предварительно подготовленного списка
     #print('Create new departments..')
-    api_prepared_list = generate_deps_list_from_api()
+    api_prepared_list = generate_deps_list_from_api(settings)
     for i in range(0, max_levels):
         #Выбираем департаменты, которые будем добавлять на каждом шаге (зависит от уровня level)
         deps_to_add = [d for d in deps_list if d['level'] == i+1]
@@ -244,16 +261,13 @@ def create_dep_from_prepared_list(deps_list, max_levels):
                             }
                 if item['email']:
                     department_info['label'] = item['email'].split('@')[0]
-                if not dry_run:
-                    logger.info(f'Trying to create {item["current"]} department.')
-                    result, message = organization.post_create_department(department_info)
-                    logger.info(message)
+                if not settings.dry_run:
+                    result =create_department_by_api(settings, department_info)
                 else:
                     logger.info(f'Dry run: department {item["current"]} will be created')
                 need_update_deps = True
-        #all_deps_from_api = organization.get_departments_list()
         if need_update_deps:
-            api_prepared_list = generate_deps_list_from_api()
+            api_prepared_list = generate_deps_list_from_api(settings)
         for item in deps_to_add:
             # Ищем в списке департаментов в 360 конкретное значение
             #d = next(i for i in all_deps_from_api if i['name'] == item['current'] and i['parentId'] == item['prevId'])
@@ -269,6 +283,7 @@ def create_dep_from_prepared_list(deps_list, max_levels):
 
 def prepare_deps_list_from_ad_hab(hierarchy):
 
+    logger.info(f'Prepare deps list from AD hierarchy. Source data has {len(hierarchy)} items.')
     deps_list = [{'current': 'All', 'prev': 'None', 'level': 0, '360id': 1, 'prevId': 0, 'path': 'All', 'email': ''}]
     # Формируем уникальный список всей иерархии подразделений (каждое подразделение имеет отдельную строку в списке)
     for item in hierarchy:
@@ -294,19 +309,22 @@ def prepare_deps_list_from_ad_hab(hierarchy):
     # Добавление в 360
     return deps_list
 
-def delete_deps_from_y360(created_deps, y360_users, reason):
-    temp_deps_from_y360 = generate_deps_list_from_api()
+def delete_deps_from_y360(settings: "SettingParams", created_deps, reason):
+    temp_deps_from_y360 = generate_deps_list_from_api(settings)
     deps_from_y360 = sorted(temp_deps_from_y360, key=lambda x: len(x['path'].split(';')))
     deps_from_y360.append({'id':1,'path':'All'})
     deps_to_delete = set()
     deps_to_change_name = []
-    if reason == "no_users":
+    y360_users = get_all_api360_users(settings, True)
+    if reason == "no_synced_from_ad":
+        logger.info(f"Source data has {len(deps_from_y360)} departments in Y360. Check if there are departments which are not synced from AD.")
         for item360 in deps_from_y360:
             if item360['path'] not in [d['path'] for d in created_deps]:
                 if item360['id'] != 1:
-                    logger.info(f"Found unused department - {item360['path']}")
+                    logger.info(f"Found department which is not synced from AD - {item360['path']}")
                     deps_to_delete.add(item360['id'])
     elif reason == "same_email":
+        logger.info(f"Found {len(deps_from_y360)} departments in Y360. Check if there are departments with same emails with AD departments.")
         for item360 in deps_from_y360:
             if item360['id'] != 1:
                 for itemAD in created_deps:
@@ -322,8 +340,10 @@ def delete_deps_from_y360(created_deps, y360_users, reason):
                             new_name = itemAD['path'].split(';')[-1]
                             if old_name != new_name:
                                 if prev360 != itemAD['prev']:
+                                    logger.info(f"Found departments with same emails {item360['mail']} but different names (old name: {old_name}, new name: {new_name}) and different parents (old parent: {prev360}, new parent: {itemAD['prev']}). Delete {item360['path']} department.")
                                     deps_to_delete.add(item360['id'])
                                 else:
+                                    logger.info(f"Found departments with same emails {item360['mail']} but different names (old name: {old_name}, new name: {new_name}) and same parents ({prev360}). Change name of department to {new_name}.")
                                     # Меняем имя подразделения в списке подразделений в 360
                                     for deps in deps_from_y360:
                                         temp_path = deps['path'].split(';')
@@ -334,11 +354,12 @@ def delete_deps_from_y360(created_deps, y360_users, reason):
                                             else:
                                                 new_path.append(temp)
                                         deps['path'] = ';'.join(new_path)
-
+                                        logger.info(f" - department path has been changed from {temp_path} to {deps['path']}.")
                                     deps_to_change_name.append({'id':item360['id'], 'name':itemAD['path'].split(';')[-1]})
                             break
 
-    if len(deps_to_delete) > 0:      
+    if len(deps_to_delete) > 0:     
+        logger.info(f"Found {len(deps_to_delete)} departments to delete.")
         for deps_id in list(deps_to_delete):
             deps_path = next(item for item in deps_from_y360 if item['id'] == deps_id)['path']
             path_to_delete = [line for line in deps_from_y360 if line['path'].startswith(deps_path)]
@@ -347,31 +368,29 @@ def delete_deps_from_y360(created_deps, y360_users, reason):
                 deps_id = next(dep for dep in deps_from_y360 if dep['path'] == item['path'])['id']
                 for user in y360_users:
                     if user['departmentId'] == deps_id:
-                        if not dry_run:
+                        if not settings.dry_run:
                             logger.info(f"Try to change department of {user['email']} user from _ {deps_path} _ to _ All _")
-                            organization.patch_user_info(
-                                    uid = user["id"],
-                                    user_data={
-                                        "departmentId": 1,
-                                    })
+                            patch_user_by_api(settings, user['id'], {'departmentId': 1})
                         else:
                             logger.info(f"Dry run: department of {user['email']} user will be changed from _ {deps_path} _ to _ All _")
 
-                if not dry_run:
-                    logger.info(f"Try to delete department {deps_path} from Y360.")
-                    organization.delete_department_by_id(deps_id)
+                if not settings.dry_run:
+                    #logger.info(f"Try to delete department {deps_path} from Y360.")
+                    department_info = {'id': deps_id, 'name': item['path']}
+                    delete_department_by_api(settings, department_info)
                 else:
                     logger.info(f"Dry run: department {deps_path} will be deleted")
 
     if len(deps_to_change_name) > 0:
+        logger.info(f"Found {len(deps_to_change_name)} departments to change name.")
         for item in deps_to_change_name:
-            if not dry_run:
+            if not settings.dry_run:
                 logger.info(f"Try to change name of department {item['id']} to {item['name']}")
-                organization.patch_department_info(item['id'], {'name': item['name']})
+                patch_user_by_api(settings, item['id'], {'name': item['name']})
             else:
                 logger.info(f"Dry run: name of department {item['id']} will be changed to {item['name']}")
 
-def assign_users_to_deps(created_deps, y360_users, ad_users):
+def assign_users_to_deps(settings: "SettingParams", created_deps, y360_users, ad_users):
     checked_users = []
     for user in ad_users:
         alias = user.split('|')[1].split(';')[1].split('@')[0]
@@ -401,12 +420,8 @@ def assign_users_to_deps(created_deps, y360_users, ad_users):
                 if deps['path'] == ad_deps_path:
                     if deps['360id'] != found_user_dep_id:
                         logger.info(f"User {y360_user['email']} found in Y360, but with wrong department. Change department to {deps['path']}")
-                        if not dry_run:
-                            organization.patch_user_info(
-                                    uid = found_id,
-                                    user_data={
-                                        "departmentId": deps['360id'],
-                                    })
+                        if not settings.dry_run:
+                            patch_user_by_api(settings, found_id, {'departmentId': deps['360id']})
                         else:
                             logger.info(f"Dry run: department of {user.split('|')[1].split(';')[1]} user will be changed from _ {found_user_dep_id} _ to _ {deps['path']} _")
                     break
@@ -424,20 +439,18 @@ def assign_users_to_deps(created_deps, y360_users, ad_users):
     for id in missed_ids:
         if users_dict[id]['departmentId'] > 1:
             logger.info(f"User {users_dict[id]['email']} not found in Active Directory. Change department to _ All _")
-            if not dry_run:
-                organization.patch_user_info(
-                        uid = id,
-                        user_data={
-                            "departmentId": 1,
-                        })
+            if not settings.dry_run:
+                    patch_user_by_api(settings, id, {'departmentId': 1})
             else:
                 logger.info(f"Dry run: department of user {users_dict[id]['email']} will be changed to _ All _")
 
-def assign_users_to_deps2(created_deps, y360_users, ad_users):
+def assign_users_to_deps2(settings: "SettingParams", created_deps, ad_users):
     add_to_360_aliases = []
     add_to_360 = []
     delete_candidates_from_360 = []
     delete_from_360 = []
+    y360_users = get_all_api360_users(settings, True)
+    logger.info(f"Assign users to departments. Found {len(created_deps)} departments in AD and {len(y360_users)} users in Y360.")
     for deps in created_deps:
         if deps['360id'] != 1:
             users_360 = [user for user in y360_users if user['departmentId'] == deps['360id']]
@@ -483,44 +496,42 @@ def assign_users_to_deps2(created_deps, y360_users, ad_users):
         if not found_user:
             delete_from_360.append(user)
 
+    if len(delete_from_360) > 0:
+        logger.info(f"Found {len(delete_from_360)} users to change department to _ All _.")
     for user in delete_from_360:
         logger.info(f"Change department of user {user['email']} to _ All _")
-        if not dry_run:
-            organization.patch_user_info(
-                    uid = user['id'],
-                    user_data={
-                        "departmentId": 1,
-                    })
+        if not settings.dry_run:
+            patch_user_by_api(settings, user['id'], {'departmentId': 1})
         else:
             logger.info(f"Dry run: department of user {user['email']} will be changed to _ All _")
 
+    if len(add_to_360) > 0:
+        logger.info(f"Found {len(add_to_360)} users to change department.")
     for user in add_to_360:
         logger.info(f"Change department of user {user['user']['email']} to {user['departmentId']}")
-        if not dry_run:
-            organization.patch_user_info(
-                    uid = user['user']['id'],
-                    user_data={
-                        "departmentId": user['departmentId'],
-                    })
+        if not settings.dry_run:
+            patch_user_by_api(settings, user['user']['id'], {'departmentId': user['departmentId']})
         else:
             logger.info(f"Dry run: Change department of user {user['user']['email']} to {user['departmentId']}")
 
-def delete_deps_with_no_users():
-    all_deps_from_api = organization.get_departments_list()
+def delete_deps_with_no_users(settings: "SettingParams"):
+    all_deps_from_api = get_all_api360_departments(settings)
+    if len(all_deps_from_api) > 1:
+        logger.info(f"Found {len(all_deps_from_api)} departments in Y360. Check if there are departments with no users.")
     for dep in all_deps_from_api:
         if dep['id'] != 1:
             if dep['membersCount'] == 0:
-                if not dry_run:
-                    logger.info(f"Try to delete department {dep['name']} from Y360.")
-                    organization.delete_department_by_id(dep['id'])
+                if not settings.dry_run:
+                    logger.info(f"Found department {dep['name']} with no users. Delete it.")
+                    delete_department_by_api(settings, dep)
                 else:
-                    logger.info(f"Dry run: department {dep['name']} will be deleted")
+                    logger.info(f"DRY RUN: Found department {dep['name']} with no users. Delete it.")
 
 def filter_empty_ad_deps(hieralchy):
     out_hieralchy = []
     if len(hieralchy) == 0:
         return []
-    
+    logger.info(f'Filter empty AD deps from hierarchy. Source data has {len(hieralchy)} items.')
     for item in hieralchy:
         found_users = False
         if '|' not in item:
@@ -532,70 +543,499 @@ def filter_empty_ad_deps(hieralchy):
                         out_hieralchy.append(line)
             if found_users:
                 out_hieralchy.append(item)
+            else:
+                logger.info(f'AD dep {compare_with} is empty. Remove from hierarchy.')
     return out_hieralchy
-                   
+
+def get_all_api360_users(settings: "SettingParams", force = False):
+    if not force:
+        logger.info("Получение всех пользователей организации из кэша...")
+
+    if not settings.all_users or force or (datetime.now() - settings.all_users_get_timestamp).total_seconds() > ALL_USERS_REFRESH_IN_MINUTES * 60:
+        #logger.info("Получение всех пользователей организации из API...")
+        settings.all_users = get_all_api360_users_from_api(settings)
+        settings.all_users_get_timestamp = datetime.now()
+    return settings.all_users
+
+def get_all_api360_users_from_api(settings: "SettingParams"):
+    logger.info("Получение всех пользователей организации из API...")
+    url = f"{DEFAULT_360_API_URL}/directory/v1/org/{settings.org_id}/users"
+    headers = {"Authorization": f"OAuth {settings.oauth_token}"}
+    has_errors = False
+    users = []
+    current_page = 1
+    last_page = 1
+    while current_page <= last_page:
+        params = {'page': current_page, 'perPage': USERS_PER_PAGE_FROM_API}
+        try:
+            retries = 1
+            while True:
+                logger.debug(f"GET URL - {url}")
+                response = requests.get(url, headers=headers, params=params)
+                logger.debug(f"x-request-id: {response.headers.get("x-request-id","")}")
+                if response.status_code != HTTPStatus.OK.value:
+                    logger.error(f"!!! ОШИБКА !!! при GET запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
+                    if retries < MAX_RETRIES:
+                        logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
+                        time.sleep(RETRIES_DELAY_SEC * retries)
+                        retries += 1
+                    else:
+                        has_errors = True
+                        break
+                else:
+                    for user in response.json()['users']:
+                        if not user.get('isRobot') and int(user["id"]) >= 1130000000000000:
+                            users.append(user)
+                    logger.debug(f"Загружено {len(response.json()['users'])} пользователей. Текущая страница - {current_page} (всего {last_page} страниц).")
+                    current_page += 1
+                    last_page = response.json()['pages']
+                    break
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"!!! ERROR !!! {type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
+            has_errors = True
+            break
+
+        if has_errors:
+            break
+
+    if has_errors:
+        print("Есть ошибки при GET запросах. Возвращается пустой список пользователей.")
+        return []
+    
+    return users
+
+@dataclass
+class SettingParams:
+    oauth_token: str
+    org_id: int
+    all_users : list
+    all_users_get_timestamp : datetime
+    dry_run : bool
+    deps_file : str
+    ad_data_file : str
+    ldap_host : str
+    ldap_port : int
+    ldap_user : str
+    ldap_password : str
+    ldap_base_dn : str
+    ldap_search_filter : str
+    hab_root_group : str
+
+
+def get_settings():
+    exit_flag = False
+    oauth_token_bad = False
+    settings = SettingParams (
+        oauth_token = os.environ.get("OAUTH_TOKEN"),
+        org_id = os.environ.get("ORG_ID"),
+        all_users = [],
+        all_users_get_timestamp = datetime.now(),
+        dry_run = os.environ.get("DRY_RUN_ARG","false").lower() == "true",
+        deps_file = os.environ.get("AD_DEPS_OUT_FILE","deps.csv"),
+        ad_data_file = os.environ.get("AD_DATA_OUT_FILE","ad_data.txt"),
+        ldap_host = os.environ.get('LDAP_HOST'),
+        ldap_port = int(os.environ.get('LDAP_PORT')),
+        ldap_user = os.environ.get('LDAP_USER'),
+        ldap_password = os.environ.get('LDAP_PASSWORD'),
+        ldap_base_dn = os.environ.get('LDAP_BASE_DN'),
+        ldap_search_filter = os.environ.get('LDAP_SEARCH_FILTER'),
+        hab_root_group = os.environ.get('HAB_ROOT_GROUP'),
+    )
+    
+    if not settings.oauth_token:
+        logger.error("OAUTH_TOKEN_ARG не установлен.")
+        oauth_token_bad = True
+
+    if not settings.org_id:
+        logger.error("ORG_ID_ARG не установлен.")
+        exit_flag = True
+
+    if not (oauth_token_bad or exit_flag):
+        if not check_oauth_token(settings.oauth_token, settings.org_id):
+            logger.error("OAUTH_TOKEN_ARG не является действительным")
+            oauth_token_bad = True
+
+    if not settings.ldap_host:
+        logger.error("LDAP_HOST не установлен.")
+        exit_flag = True
+
+    if not settings.ldap_port:
+        logger.error("LDAP_PORT не установлен.")
+        exit_flag = True
+
+    if not settings.ldap_user:
+        logger.error("LDAP_USER не установлен.")
+        exit_flag = True
+
+    if not settings.ldap_password:
+        logger.error("LDAP_PASSWORD не установлен.")
+        exit_flag = True
+
+    if not settings.ldap_base_dn:
+        logger.error("LDAP_BASE_DN не установлен.")
+        exit_flag = True
+
+    if not settings.ldap_search_filter:
+        logger.error("LDAP_SEARCH_FILTER не установлен.")
+        exit_flag = True
+
+    if not settings.hab_root_group:
+        logger.error("HAB_ROOT_GROUP не установлен.")
+        exit_flag = True
+
+    if oauth_token_bad:
+        exit_flag = True
+    
+    if exit_flag:
+        return None
+    
+    return settings
+
+
+def check_oauth_token(oauth_token, org_id):
+    """Проверяет, что токен OAuth действителен."""
+    url = f"{DEFAULT_360_API_URL}/directory/v1/org/{org_id}/users?perPage=100"
+    headers = {
+        "Authorization": f"OAuth {oauth_token}"
+    }
+    response = requests.get(url, headers=headers)
+    if response.status_code == HTTPStatus.OK:
+        return True
+    return False
+
+def mask_sensitive_data(data: dict) -> dict:
+    """
+    Создает копию словаря с замаскированными чувствительными данными для безопасного логирования.
+    
+    Args:
+        data (dict): Исходный словарь с данными
+        
+    Returns:
+        dict: Копия словаря с замаскированными паролями и токенами
+    """
+    import copy
+    
+    # Создаем глубокую копию для безопасного изменения
+    masked_data = copy.deepcopy(data)
+    
+    # Список полей, которые нужно замаскировать
+    sensitive_fields = SENSITIVE_FIELDS
+    
+    def mask_recursive(obj):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if key.lower() in sensitive_fields:
+                    obj[key] = "***MASKED***"
+                elif isinstance(value, (dict, list)):
+                    mask_recursive(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                mask_recursive(item)
+    
+    mask_recursive(masked_data)
+    return masked_data
+
+def create_user_by_api(settings: "SettingParams", user: dict):
+
+    url = f"{DEFAULT_360_API_URL}/directory/v1/org/{settings.org_id}/users"
+    headers = {"Authorization": f"OAuth {settings.oauth_token}"}
+    logger.debug(f"POST URL: {url}")
+    logger.debug(f"POST DATA: {mask_sensitive_data(user)}")
+    retries = 1
+    added_user = {}
+    success = False
+    while True:
+        try:
+            response = requests.post(f"{url}", headers=headers, json=user)
+            logger.debug(f"x-request-id: {response.headers.get("X-Request-Id","")}")
+            if response.status_code != HTTPStatus.OK.value:
+                logger.error(f"Error during POST request: {response.status_code}. Error message: {response.text}")
+                if retries < MAX_RETRIES:
+                    logger.error(f"Retrying ({retries+1}/{MAX_RETRIES})")
+                    time.sleep(RETRIES_DELAY_SEC * retries)
+                    retries += 1
+                else:
+                    logger.error(f"Ошибка. Создание пользователя {user['nickname']} ({user['name']['last']} {user['name']['first']}) не удалось.")
+                    break
+            else:
+                logger.info(f"Успех - пользователь {user['nickname']} ({user['name']['last']} {user['name']['first']}) создан успешно.")
+                added_user = response.json()
+                success = True
+                break
+        except Exception as e:
+            logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
+
+    return success, added_user
+
+def patch_user_by_api(settings: "SettingParams", user_id: int, patch_data: dict):
+    logger.info(f"Изменение пользователя {user_id} в API...")
+    url = f"{DEFAULT_360_API_URL}/directory/v1/org/{settings.org_id}/users/{user_id}"
+    headers = {"Authorization": f"OAuth {settings.oauth_token}"}
+    logger.debug(f"PATCH URL: {url}")
+    logger.debug(f"PATCH DATA: {mask_sensitive_data(patch_data)}")
+    retries = 1
+    success = False
+    while True:
+        try:
+            response = requests.patch(f"{url}", headers=headers, json=patch_data)
+            logger.debug(f"x-request-id: {response.headers.get("X-Request-Id","")}")
+            if response.status_code != HTTPStatus.OK.value:
+                logger.error(f"Error during PATCH request: {response.status_code}. Error message: {response.text}")
+                if retries < MAX_RETRIES:
+                    logger.error(f"Retrying ({retries+1}/{MAX_RETRIES})")
+                    time.sleep(RETRIES_DELAY_SEC * retries)
+                    retries += 1
+                else:
+                    logger.error(f"Ошибка. Изменение пользователя {user_id} не удалось.")
+                    break
+            else:
+                logger.info(f"Успех - данные пользователя {user_id} изменены успешно.")
+                success = True
+                break
+        except Exception as e:
+            logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
+
+    return success
+
+def patch_department_by_api(settings: "SettingParams", department_id: int, patch_data: dict):
+    logger.info(f"Изменение подразделения {department_id} в API...")
+    url = f"{DEFAULT_360_API_URL}/directory/v1/org/{settings.org_id}/departments/{department_id}"
+    headers = {"Authorization": f"OAuth {settings.oauth_token}"}
+    logger.debug(f"PATCH URL: {url}")
+    logger.debug(f"PATCH DATA: {mask_sensitive_data(patch_data)}")
+    retries = 1
+    success = False
+    while True:
+        try:
+            response = requests.patch(f"{url}", headers=headers, json=patch_data)
+            logger.debug(f"x-request-id: {response.headers.get("X-Request-Id","")}")
+            if response.status_code != HTTPStatus.OK.value:
+                logger.error(f"Error during PATCH request: {response.status_code}. Error message: {response.text}")
+                if retries < MAX_RETRIES:
+                    logger.error(f"Retrying ({retries+1}/{MAX_RETRIES})")
+                    time.sleep(RETRIES_DELAY_SEC * retries)
+                    retries += 1
+                else:
+                    logger.error(f"Ошибка. Изменение подразделения {department_id} не удалось.")
+                    break
+            else:
+                logger.info(f"Успех - данные подразделения {department_id} изменены успешно.")
+                success = True
+                break
+        except Exception as e:
+            logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
+
+    return success
+
+def get_all_api360_departments(settings: "SettingParams"):
+    logger.info("Получение всех подразделений организации из API...")
+    url = f"{DEFAULT_360_API_URL}/directory/v1/org/{settings.org_id}/departments"
+    headers = {"Authorization": f"OAuth {settings.oauth_token}"}
+
+    has_errors = False
+    departments = []
+    current_page = 1
+    last_page = 1
+    while current_page <= last_page:
+        params = {'page': current_page, 'perPage': DEPARTMENTS_PER_PAGE_FROM_API}
+        try:
+            retries = 1
+            while True:
+                logger.debug(f"GET URL - {url}")
+                response = requests.get(url, headers=headers, params=params)
+                logger.debug(f"x-request-id: {response.headers.get("x-request-id","")}")
+                if response.status_code != HTTPStatus.OK.value:
+                    logger.error(f"!!! ОШИБКА !!! при GET запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
+                    if retries < MAX_RETRIES:
+                        logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
+                        time.sleep(RETRIES_DELAY_SEC * retries)
+                        retries += 1
+                    else:
+                        has_errors = True
+                        break
+                else:
+                    for deps in response.json()['departments']:
+                        departments.append(deps)
+                    logger.debug(f"Загружено {len(response.json()['departments'])} подразделений. Текущая страница - {current_page} (всего {last_page} страниц).")
+                    current_page += 1
+                    last_page = response.json()['pages']
+                    break
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"!!! ERROR !!! {type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
+            has_errors = True
+            break
+
+        if has_errors:
+            break
+
+    if has_errors:
+        print("Есть ошибки при GET запросах. Возвращается пустой список подразделений.")
+        return []
+    
+    return departments
+
+def delete_department_by_api(settings: "SettingParams", department: dict):
+    logger.info(f"Удаление подразделения {department['id']} ({department['name']}) из API...")
+    url = f"{DEFAULT_360_API_URL}/directory/v1/org/{settings.org_id}/departments/{department['id']}"
+    headers = {"Authorization": f"OAuth {settings.oauth_token}"}
+    logger.debug(f"DELETE URL: {url}")
+    try:
+        retries = 1
+        while True:
+            response = requests.delete(f"{url}", headers=headers)
+            logger.debug(f"x-request-id: {response.headers.get("X-Request-Id","")}")
+            if response.status_code != HTTPStatus.OK.value:
+                logger.error(f"!!! ОШИБКА !!! при DELETE запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
+                if retries < MAX_RETRIES:
+                    logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
+                    time.sleep(RETRIES_DELAY_SEC * retries)
+                    retries += 1
+                else:
+                    has_errors = True
+                    break
+            else:
+                logger.info(f"Успех - подразделение {department['id']} ({department['name']}) удалено успешно.")
+                return True
+    except requests.exceptions.RequestException as e:
+        logger.error(f"!!! ERROR !!! {type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
+        has_errors = True
+
+    if has_errors:
+        print("Есть ошибки при DELETE запросах. Возвращается False.")
+        return False
+
+    return True
+
+
+def delete_all_departments(settings: "SettingParams"):
+    logger.info("Удаление всех подразделений организации...")
+    departments = get_all_api360_departments(settings)
+    if len(departments) == 0:
+        logger.info("Нет подразделений для удаления.")
+        return
+    logger.info(f"Удаление {len(departments)} подразделений...")
+    for department in departments:
+        delete_department_by_api(settings, department)
+    logger.info("Удаление всех подразделений завершено.")
+    return
+
+def create_department_by_api(settings: "SettingParams", department: dict):
+    logger.info(f"Создание подразделения {department['name']} в API...")
+    url = f"{DEFAULT_360_API_URL}/directory/v1/org/{settings.org_id}/departments"
+    headers = {"Authorization": f"OAuth {settings.oauth_token}"}
+    logger.debug(f"POST URL: {url}")
+    logger.debug(f"POST DATA: {department}")
+    try:
+        retries = 1
+        while True:
+            response = requests.post(f"{url}", headers=headers, json=department)
+            logger.debug(f"x-request-id: {response.headers.get("X-Request-Id","")}")
+            if response.status_code != HTTPStatus.OK.value:
+                logger.error(f"!!! ОШИБКА !!! при POST запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
+                if retries < MAX_RETRIES:
+                    logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
+                    time.sleep(RETRIES_DELAY_SEC * retries)
+                    retries += 1
+                else:
+                    has_errors = True
+                    break
+            else:
+                logger.info(f"Успех - подразделение {department['name']} создано успешно.")
+                return True
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"!!! ERROR !!! {type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
+        has_errors = True
+
+    if has_errors:
+        print("Есть ошибки при POST запросах. Возвращается False.")
+        return False
+
+    return True
+
+
+def clear_dep_info_for_users(settings: "SettingParams"):
+    # Функция для удаления признака членства пользователя в каком-либо департаменте
+    users = get_all_api360_users(settings)
+    print('Перемещение пользователей в департамент "Все"...')
+    for user in users:
+        if user.get("departmentId") != 1:
+            patch_user_by_api(settings,
+                            user_id=user.get("id"),
+                            patch_data={
+                                "departmentId": 1,
+                            })
+    print('Перемещение пользователей в департамент "Все" завершено.')
+    return
+
 
 if __name__ == "__main__":
     denv_path = os.path.join(os.path.dirname(__file__), '.env_ldap')
 
     if os.path.exists(denv_path):
         load_dotenv(dotenv_path=denv_path,verbose=True, override=True)
+    else:
+        logger.error("Не найден файл .env_ldap. Выход.")
+        sys.exit(EXIT_CODE)
     
-    organization = API360(os.environ.get('orgId'), os.environ.get('token'))
+    logger.info("\n")
+    logger.info("---------------------------------------------------------------------------.")
+    logger.info("Запуск скрипта.")
+    
+    settings = get_settings()
+    
+    if settings is None:
+        logger.error("Проверьте настройки в файле .env и попробуйте снова.")
+        sys.exit(EXIT_CODE)
 
-    if not organization.check_connections_for_deps():
-        logger.error('\n')
-        logger.error('Connection to Y360 failed. Check token or Org ID parameters. Exit.\n')
-        sys.exit(1)
-
-    dry_run = False
-    if os.environ.get('DRY_RUN'):
-        if os.environ.get('DRY_RUN').lower() == 'true' or os.environ.get('DRY_RUN').lower() == '1':
-            dry_run = True
-
-    logger.info('---------------Start-----------------')
-    if dry_run:
+    if settings.dry_run:
         logger.info('- Режим тестового прогона включен (DRY_RUN = True)! Изменения не сохраняются! -')
 
-    hieralchy, all_dn = build_group_hierarchy()
+    hieralchy, all_dn = build_group_hierarchy(settings)
 
     if not hieralchy:
         logger.error('\n')
         logger.error('List of current departments form Active directory is empty. Exit.\n')
-        sys.exit(1)
+        sys.exit(EXIT_CODE)
     if not check_similar_groups_in_hierarchy(all_dn):
-        sys.exit(1)
+        sys.exit(EXIT_CODE)
     if not check_similar_mails_in_hierarchy(hieralchy):
         #sys.exit(1)
         pass
 
     hieralchy = filter_empty_ad_deps(hieralchy)
     final_list = prepare_deps_list_from_ad_hab(hieralchy)
-    y360_users = organization.get_all_users()
-    delete_deps_from_y360(final_list, y360_users, "same_email")
+    delete_deps_from_y360(settings, final_list, "same_email")
     max_levels = max([len(s['path'].split(';')) for s in final_list])
-    created_deps = create_dep_from_prepared_list(final_list,max_levels)
+    created_deps = create_dep_from_prepared_list(settings, final_list,max_levels)
+    exit_flag = False
     for item in created_deps:
         if item['360id'] == 0:
-            if not dry_run:
+            if not settings.dry_run:
                 logger.error('\n')
-                logger.error('Not all departments from Active Directory were saved in Yandex 360. Fix errors. Exit.\n')
-                sys.exit(1)
+                logger.error(f'Department {item["path"]} not saved in Yandex 360.')
+                exit_flag = True
+    if exit_flag:
+        logger.error('\n')
+        logger.error('Not all departments from Active Directory were saved in Yandex 360. Fix errors. Exit.\n')
+        sys.exit(EXIT_CODE)
     
-    if not y360_users:
+    if not get_all_api360_users(settings):
         logger.error('\n')
         logger.error('List of users from Yandex 360 is empty. Exit.\n')
-        sys.exit(1)
+        sys.exit(EXIT_CODE)
     
     ad_users = [item for item in hieralchy if '|' in item]
     if not ad_users:
         logger.error('\n')
         logger.error('List of users from Active Directory is empty. Exit.\n')
-        sys.exit(1)
-    assign_users_to_deps2(created_deps, y360_users, ad_users)
-    y360_users = organization.get_all_users()
-    delete_deps_from_y360(final_list, y360_users, "no_users")
-    delete_deps_with_no_users()
+        sys.exit(EXIT_CODE)
+
+    assign_users_to_deps2(settings, created_deps, ad_users)
+    delete_deps_from_y360(settings,final_list, "no_synced_from_ad")
+    delete_deps_with_no_users(settings)
 
     logger.info('---------------End-----------------')
 
