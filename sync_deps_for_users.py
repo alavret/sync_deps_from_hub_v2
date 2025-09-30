@@ -127,7 +127,7 @@ def build_group_hierarchy(settings: "SettingParams"):
         with open(settings.ad_data_file, "w", encoding="utf-8") as f:
             for line in hierarchy:
                 f.write(f"{line}\n")
-    logger.info(f'AD data has been saved to file {settings.ad_data_file} ({len(hierarchy)} lines).')
+        logger.info(f'AD data has been saved to file {settings.ad_data_file} ({len(hierarchy)} lines).')
     return hierarchy, all_dn
 
 def build_hierarcy_recursive(conn, settings: "SettingParams", attrib_list, base, item, hierarchy, all_dn, users):
@@ -154,15 +154,15 @@ def build_hierarcy_recursive(conn, settings: "SettingParams", attrib_list, base,
                 else:
                     hierarchy.append(f"{base};{item['cn'].value}~{group_mail}")
                     previuos = f"{base};{item['cn'].value}"
-                logger.info(f'Add group {item['distinguishedName'].value} to hierarchy.')
-                logger.info(f'Add users to group {item['distinguishedName'].value}')
+                logger.info(f"Add group {item['distinguishedName'].value} to hierarchy.")
+                logger.info(f"Add users to group {item['distinguishedName'].value}")
                 count_users = 0
                 for user in users:
                     if len(user["extensionAttribute14"]) > 0:
                         if user["extensionAttribute14"] == sam_name:
                             count_users += 1
                             hierarchy.append(f"{previuos}|{user['displayName']};{user['mail']}")
-                logger.info(f'Added {count_users} users to group {item['distinguishedName'].value}.')
+                logger.info(f"Added {count_users} users to group {item['distinguishedName'].value}.")
                 hierarchy, all_dn = build_hierarcy_recursive(conn, settings, attrib_list, previuos, item, hierarchy, all_dn, users)
 
 
@@ -208,20 +208,26 @@ def check_similar_mails_in_hierarchy(hierarchy):
     count_disct = {}
     for item in hierarchy:
         if '|' in item:
-            email = item.split('|')[1].split(';')[1]
-            if email in count_disct.keys():
-                count_disct[email] += 1
+            alias = item.split('|')[1].split(';')[1].split('@')[0]
+        elif '~' in item:
+            alias = item.split('~')[1].split('@')[0]
+        if alias:
+            if alias in count_disct.keys():
+                count_disct[alias] += 1
             else:
-                count_disct[email] = 1
+                count_disct[alias] = 1
 
-    bad_emails = [k for k, v in count_disct.items() if v > 1]
-    if len(bad_emails) > 0:
-        logger.error('Error! One or several AD users exist in several HAB groups.')
-        for email in bad_emails:
+    bad_aliases = [k for k, v in count_disct.items() if v > 1]
+    if len(bad_aliases) > 0:
+        logger.error('Error! One or several AD users or groups have similar aliases. Check emails of this users or groups.')
+        for alias in bad_aliases:
             for item in hierarchy:
                 if '|' in item:
-                    if item.split('|')[1].split(';')[1] == email:
-                        logger.error(f'AD User {item.split('|')[1].split(';')[0]} with email {item.split('|')[1].split(';')[1]} found in group {item.split("|")[0]}')
+                    if item.split('|')[1].split(';')[1].split('@')[0] == alias:
+                        logger.error(f"AD User _ {item.split('|')[1].split(';')[0]} _ with alias _ {item.split('|')[1].split(';')[1].split('@')[0]} _ in group _ {item.split('|')[0]} _.")
+                elif '~' in item:
+                    if item.split('~')[1].split('@')[0] == alias:
+                        logger.error(f"AD Group _ {item.split('~')[0]} _ with alias _ {item.split('~')[1]} _.")
         return False
     return True 
 
@@ -281,7 +287,7 @@ def create_dep_from_prepared_list(settings: "SettingParams", deps_list, max_leve
     return deps_list
 
 
-def prepare_deps_list_from_ad_hab(hierarchy):
+def prepare_deps_list_from_ad_hab(settings: "SettingParams", hierarchy):
 
     logger.info(f'Prepare deps list from AD hierarchy. Source data has {len(hierarchy)} items.')
     deps_list = [{'current': 'All', 'prev': 'None', 'level': 0, '360id': 1, 'prevId': 0, 'path': 'All', 'email': ''}]
@@ -306,6 +312,12 @@ def prepare_deps_list_from_ad_hab(hierarchy):
                 item['path'] = item['current']
             else:
                 item['path'] = f'{item["prev"]};{item["current"]}'
+
+    if settings.deps_file:
+        with open(settings.deps_file, "w", encoding="utf-8") as f:
+            for line in deps_list:
+                f.write(f"{line['current']}~{line['prev']}~{line['level']}~{line['360id']}~{line['prevId']}~{line['path']}~{line['email']}\n")
+        logger.info(f'AD data has been saved to file {settings.deps_file} ({len(deps_list)} lines).')
     # Добавление в 360
     return deps_list
 
@@ -348,13 +360,15 @@ def delete_deps_from_y360(settings: "SettingParams", created_deps, reason):
                                     for deps in deps_from_y360:
                                         temp_path = deps['path'].split(';')
                                         new_path = []
-                                        for temp in temp_path:
-                                            if temp == old_name:
-                                                new_path.append(new_name)
-                                            else:
-                                                new_path.append(temp)
-                                        deps['path'] = ';'.join(new_path)
-                                        logger.info(f" - department path has been changed from {temp_path} to {deps['path']}.")
+                                        if old_name in temp_path:
+                                            for temp in temp_path:
+                                                if temp == old_name:
+                                                    new_path.append(new_name)
+                                                else:
+                                                    new_path.append(temp)
+                                            logger.info(f" - department path has been changed from {';'.join(temp_path)} to {deps['path']}.")
+                                            deps['path'] = ';'.join(new_path)
+                                        
                                     deps_to_change_name.append({'id':item360['id'], 'name':itemAD['path'].split(';')[-1]})
                             break
 
@@ -527,25 +541,25 @@ def delete_deps_with_no_users(settings: "SettingParams"):
                 else:
                     logger.info(f"DRY RUN: Found department {dep['name']} with no users. Delete it.")
 
-def filter_empty_ad_deps(hieralchy):
-    out_hieralchy = []
-    if len(hieralchy) == 0:
+def filter_empty_ad_deps(hierarchy):
+    out_hierarchy = []
+    if len(hierarchy) == 0:
         return []
-    logger.info(f'Filter empty AD deps from hierarchy. Source data has {len(hieralchy)} items.')
-    for item in hieralchy:
+    logger.info(f'Filter empty AD deps from hierarchy. Source data has {len(hierarchy)} items.')
+    for item in hierarchy:
         found_users = False
         if '|' not in item:
             compare_with = item.split('~')[0]
-            for line in hieralchy:
+            for line in hierarchy:
                 if '|' in line:
                     if line.split('|')[0] == compare_with:
                         found_users = True
-                        out_hieralchy.append(line)
+                        out_hierarchy.append(line)
             if found_users:
-                out_hieralchy.append(item)
+                out_hierarchy.append(item)
             else:
                 logger.info(f'AD dep {compare_with} is empty. Remove from hierarchy.')
-    return out_hieralchy
+    return out_hierarchy
 
 def get_all_api360_users(settings: "SettingParams", force = False):
     if not force:
@@ -572,7 +586,7 @@ def get_all_api360_users_from_api(settings: "SettingParams"):
             while True:
                 logger.debug(f"GET URL - {url}")
                 response = requests.get(url, headers=headers, params=params)
-                logger.debug(f"x-request-id: {response.headers.get("x-request-id","")}")
+                logger.debug(f"x-request-id: {response.headers.get('x-request-id','')}")
                 if response.status_code != HTTPStatus.OK.value:
                     logger.error(f"!!! ОШИБКА !!! при GET запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
                     if retries < MAX_RETRIES:
@@ -621,6 +635,7 @@ class SettingParams:
     ldap_base_dn : str
     ldap_search_filter : str
     hab_root_group : str
+    load_ad_data_from_file : bool
 
 
 def get_settings():
@@ -641,6 +656,7 @@ def get_settings():
         ldap_base_dn = os.environ.get('LDAP_BASE_DN'),
         ldap_search_filter = os.environ.get('LDAP_SEARCH_FILTER'),
         hab_root_group = os.environ.get('HAB_ROOT_GROUP'),
+        load_ad_data_from_file = os.environ.get("LOAD_AD_DATA_FROM_FILE","false").lower() == "true",
     )
     
     if not settings.oauth_token:
@@ -656,33 +672,34 @@ def get_settings():
             logger.error("OAUTH_TOKEN_ARG не является действительным")
             oauth_token_bad = True
 
-    if not settings.ldap_host:
-        logger.error("LDAP_HOST не установлен.")
-        exit_flag = True
+    if not settings.load_ad_data_from_file:
+        if not settings.ldap_host:
+            logger.error("LDAP_HOST не установлен.")
+            exit_flag = True
 
-    if not settings.ldap_port:
-        logger.error("LDAP_PORT не установлен.")
-        exit_flag = True
+        if not settings.ldap_port:
+            logger.error("LDAP_PORT не установлен.")
+            exit_flag = True
 
-    if not settings.ldap_user:
-        logger.error("LDAP_USER не установлен.")
-        exit_flag = True
+        if not settings.ldap_user:
+            logger.error("LDAP_USER не установлен.")
+            exit_flag = True
 
-    if not settings.ldap_password:
-        logger.error("LDAP_PASSWORD не установлен.")
-        exit_flag = True
+        if not settings.ldap_password:
+            logger.error("LDAP_PASSWORD не установлен.")
+            exit_flag = True
 
-    if not settings.ldap_base_dn:
-        logger.error("LDAP_BASE_DN не установлен.")
-        exit_flag = True
+        if not settings.ldap_base_dn:
+            logger.error("LDAP_BASE_DN не установлен.")
+            exit_flag = True
 
-    if not settings.ldap_search_filter:
-        logger.error("LDAP_SEARCH_FILTER не установлен.")
-        exit_flag = True
+        if not settings.ldap_search_filter:
+            logger.error("LDAP_SEARCH_FILTER не установлен.")
+            exit_flag = True
 
-    if not settings.hab_root_group:
-        logger.error("HAB_ROOT_GROUP не установлен.")
-        exit_flag = True
+        if not settings.hab_root_group:
+            logger.error("HAB_ROOT_GROUP не установлен.")
+            exit_flag = True
 
     if oauth_token_bad:
         exit_flag = True
@@ -748,7 +765,7 @@ def create_user_by_api(settings: "SettingParams", user: dict):
     while True:
         try:
             response = requests.post(f"{url}", headers=headers, json=user)
-            logger.debug(f"x-request-id: {response.headers.get("X-Request-Id","")}")
+            logger.debug(f"x-request-id: {response.headers.get('x-request-id','')}")
             if response.status_code != HTTPStatus.OK.value:
                 logger.error(f"Error during POST request: {response.status_code}. Error message: {response.text}")
                 if retries < MAX_RETRIES:
@@ -779,7 +796,7 @@ def patch_user_by_api(settings: "SettingParams", user_id: int, patch_data: dict)
     while True:
         try:
             response = requests.patch(f"{url}", headers=headers, json=patch_data)
-            logger.debug(f"x-request-id: {response.headers.get("X-Request-Id","")}")
+            logger.debug(f"x-request-id: {response.headers.get('x-request-id','')}")
             if response.status_code != HTTPStatus.OK.value:
                 logger.error(f"Error during PATCH request: {response.status_code}. Error message: {response.text}")
                 if retries < MAX_RETRIES:
@@ -809,7 +826,7 @@ def patch_department_by_api(settings: "SettingParams", department_id: int, patch
     while True:
         try:
             response = requests.patch(f"{url}", headers=headers, json=patch_data)
-            logger.debug(f"x-request-id: {response.headers.get("X-Request-Id","")}")
+            logger.debug(f"x-request-id: {response.headers.get('x-request-id','')}")
             if response.status_code != HTTPStatus.OK.value:
                 logger.error(f"Error during PATCH request: {response.status_code}. Error message: {response.text}")
                 if retries < MAX_RETRIES:
@@ -844,7 +861,7 @@ def get_all_api360_departments(settings: "SettingParams"):
             while True:
                 logger.debug(f"GET URL - {url}")
                 response = requests.get(url, headers=headers, params=params)
-                logger.debug(f"x-request-id: {response.headers.get("x-request-id","")}")
+                logger.debug(f"x-request-id: {response.headers.get('x-request-id','')}")
                 if response.status_code != HTTPStatus.OK.value:
                     logger.error(f"!!! ОШИБКА !!! при GET запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
                     if retries < MAX_RETRIES:
@@ -885,7 +902,7 @@ def delete_department_by_api(settings: "SettingParams", department: dict):
         retries = 1
         while True:
             response = requests.delete(f"{url}", headers=headers)
-            logger.debug(f"x-request-id: {response.headers.get("X-Request-Id","")}")
+            logger.debug(f"x-request-id: {response.headers.get('x-request-id','')}")
             if response.status_code != HTTPStatus.OK.value:
                 logger.error(f"!!! ОШИБКА !!! при DELETE запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
                 if retries < MAX_RETRIES:
@@ -931,7 +948,7 @@ def create_department_by_api(settings: "SettingParams", department: dict):
         retries = 1
         while True:
             response = requests.post(f"{url}", headers=headers, json=department)
-            logger.debug(f"x-request-id: {response.headers.get("X-Request-Id","")}")
+            logger.debug(f"x-request-id: {response.headers.get('x-request-id','')}")
             if response.status_code != HTTPStatus.OK.value:
                 logger.error(f"!!! ОШИБКА !!! при POST запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
                 if retries < MAX_RETRIES:
@@ -993,20 +1010,26 @@ if __name__ == "__main__":
     if settings.dry_run:
         logger.info('- Режим тестового прогона включен (DRY_RUN = True)! Изменения не сохраняются! -')
 
-    hieralchy, all_dn = build_group_hierarchy(settings)
+    #hierarchy, all_dn = build_group_hierarchy(settings)
+    if settings.load_ad_data_from_file:
+        hierarchy = load_heirarchy_from_file(settings.ad_data_file)
+        if not check_similar_mails_in_hierarchy(hierarchy):
+            #sys.exit(1)
+            pass
+    else:
+        hierarchy, all_dn = build_group_hierarchy(settings)
+        if not hierarchy:
+            logger.error('\n')
+            logger.error('List of current departments form Active directory is empty. Exit.\n')
+            sys.exit(EXIT_CODE)
+        if not check_similar_groups_in_hierarchy(all_dn):
+            sys.exit(EXIT_CODE)
+        if not check_similar_mails_in_hierarchy(hierarchy):
+            #sys.exit(1)
+            pass
 
-    if not hieralchy:
-        logger.error('\n')
-        logger.error('List of current departments form Active directory is empty. Exit.\n')
-        sys.exit(EXIT_CODE)
-    if not check_similar_groups_in_hierarchy(all_dn):
-        sys.exit(EXIT_CODE)
-    if not check_similar_mails_in_hierarchy(hieralchy):
-        #sys.exit(1)
-        pass
-
-    hieralchy = filter_empty_ad_deps(hieralchy)
-    final_list = prepare_deps_list_from_ad_hab(hieralchy)
+    #hierarchy = filter_empty_ad_deps(hierarchy)
+    final_list = prepare_deps_list_from_ad_hab(settings, hierarchy)
     delete_deps_from_y360(settings, final_list, "same_email")
     max_levels = max([len(s['path'].split(';')) for s in final_list])
     created_deps = create_dep_from_prepared_list(settings, final_list,max_levels)
@@ -1019,15 +1042,15 @@ if __name__ == "__main__":
                 exit_flag = True
     if exit_flag:
         logger.error('\n')
-        logger.error('Not all departments from Active Directory were saved in Yandex 360. Fix errors. Exit.\n')
-        sys.exit(EXIT_CODE)
+        logger.error('Not all departments from Active Directory were saved in Yandex 360. Fix errors.\n')
+        #sys.exit(EXIT_CODE)
     
     if not get_all_api360_users(settings):
         logger.error('\n')
         logger.error('List of users from Yandex 360 is empty. Exit.\n')
         sys.exit(EXIT_CODE)
     
-    ad_users = [item for item in hieralchy if '|' in item]
+    ad_users = [item for item in hierarchy if '|' in item]
     if not ad_users:
         logger.error('\n')
         logger.error('List of users from Active Directory is empty. Exit.\n')
