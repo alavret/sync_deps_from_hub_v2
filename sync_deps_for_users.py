@@ -187,7 +187,7 @@ def generate_deps_list_from_api(settings: "SettingParams"):
         if prevId > 0:
             while not prevId == 1:
                 d = next(i for i in all_deps_from_api if i['id'] == prevId)
-                path = f'{d["name"].strip()};{path}'
+                path = f"{d['name'].strip()};{path}"
                 prevId = d['parentId']
             element = {'id':item['id'], 'parentId':item['parentId'], 'path':path, 'mail':mail}
             all_deps.append(element)
@@ -195,7 +195,7 @@ def generate_deps_list_from_api(settings: "SettingParams"):
 
 def load_heirarchy_from_file(file_path):
     hierarchy = []
-    with open(file_path, 'r') as f:
+    with open(file_path, 'r', encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
@@ -270,7 +270,7 @@ def create_dep_from_prepared_list(settings: "SettingParams", deps_list, max_leve
                 if not settings.dry_run:
                     result =create_department_by_api(settings, department_info)
                 else:
-                    logger.info(f'Dry run: department {item["current"]} will be created')
+                    logger.info(f"Dry run: department {item['current']} will be created")
                 need_update_deps = True
         if need_update_deps:
             api_prepared_list = generate_deps_list_from_api(settings)
@@ -311,7 +311,7 @@ def prepare_deps_list_from_ad_hab(settings: "SettingParams", hierarchy):
             if item['prev'] == 'All':
                 item['path'] = item['current']
             else:
-                item['path'] = f'{item["prev"]};{item["current"]}'
+                item['path'] = f"{item['prev']};{item['current']}"
 
     if settings.deps_file:
         with open(settings.deps_file, "w", encoding="utf-8") as f:
@@ -374,33 +374,36 @@ def delete_deps_from_y360(settings: "SettingParams", created_deps, reason):
 
     if len(deps_to_delete) > 0:     
         logger.info(f"Found {len(deps_to_delete)} departments to delete.")
+        deleted_deps = []
         for deps_id in list(deps_to_delete):
             deps_path = next(item for item in deps_from_y360 if item['id'] == deps_id)['path']
             path_to_delete = [line for line in deps_from_y360 if line['path'].startswith(deps_path)]
             sorted_paths = sorted(path_to_delete, key=lambda x: len(x['path']), reverse=True)
             for item in sorted_paths:
                 deps_id = next(dep for dep in deps_from_y360 if dep['path'] == item['path'])['id']
-                for user in y360_users:
-                    if user['departmentId'] == deps_id:
-                        if not settings.dry_run:
-                            logger.info(f"Try to change department of {user['email']} user from _ {deps_path} _ to _ All _")
-                            patch_user_by_api(settings, user['id'], {'departmentId': 1})
-                        else:
-                            logger.info(f"Dry run: department of {user['email']} user will be changed from _ {deps_path} _ to _ All _")
+                if deps_id not in deleted_deps:
+                    deleted_deps.append(deps_id)
+                    for user in y360_users:
+                        if user['departmentId'] == deps_id:
+                            if not settings.dry_run:
+                                logger.info(f"Try to change department of {user['email']} user from _ {deps_path} _ to _ All _")
+                                patch_user_by_api(settings, user['id'], {'departmentId': 1})
+                            else:
+                                logger.info(f"Dry run: department of {user['email']} user will be changed from _ {deps_path} _ to _ All _")
 
-                if not settings.dry_run:
-                    #logger.info(f"Try to delete department {deps_path} from Y360.")
-                    department_info = {'id': deps_id, 'name': item['path']}
-                    delete_department_by_api(settings, department_info)
-                else:
-                    logger.info(f"Dry run: department {deps_path} will be deleted")
+                    if not settings.dry_run:
+                        #logger.info(f"Try to delete department {deps_path} from Y360.")
+                        department_info = {'id': deps_id, 'name': item['path']}
+                        delete_department_by_api(settings, department_info)
+                    else:
+                        logger.info(f"Dry run: department {deps_path} will be deleted")
 
     if len(deps_to_change_name) > 0:
         logger.info(f"Found {len(deps_to_change_name)} departments to change name.")
         for item in deps_to_change_name:
             if not settings.dry_run:
                 logger.info(f"Try to change name of department {item['id']} to {item['name']}")
-                patch_user_by_api(settings, item['id'], {'name': item['name']})
+                patch_department_by_api(settings, item['id'], {'name': item['name']})
             else:
                 logger.info(f"Dry run: name of department {item['id']} will be changed to {item['name']}")
 
@@ -480,7 +483,7 @@ def assign_users_to_deps2(settings: "SettingParams", created_deps, ad_users):
                         found_user = True
                         break
                 if not found_user:
-                    add_to_360_aliases.append({"alias":email, "departmentId":deps['360id']})
+                    add_to_360_aliases.append({"alias":email, "departmentId":deps['360id'], "path" : deps['path']})
 
             for user in users_360:
                 found_user = False
@@ -522,7 +525,7 @@ def assign_users_to_deps2(settings: "SettingParams", created_deps, ad_users):
     if len(add_to_360) > 0:
         logger.info(f"Found {len(add_to_360)} users to change department.")
     for user in add_to_360:
-        logger.info(f"Change department of user {user['user']['email']} to {user['departmentId']}")
+        logger.info(f"Change department of user {user['user']['email']} to {user['path']} (departmentId: {user['departmentId']})")
         if not settings.dry_run:
             patch_user_by_api(settings, user['user']['id'], {'departmentId': user['departmentId']})
         else:
@@ -636,7 +639,7 @@ class SettingParams:
     ldap_search_filter : str
     hab_root_group : str
     load_ad_data_from_file : bool
-
+    api_data_out_file : str
 
 def get_settings():
     exit_flag = False
@@ -657,6 +660,7 @@ def get_settings():
         ldap_search_filter = os.environ.get('LDAP_SEARCH_FILTER'),
         hab_root_group = os.environ.get('HAB_ROOT_GROUP'),
         load_ad_data_from_file = os.environ.get("LOAD_AD_DATA_FROM_FILE","false").lower() == "true",
+        api_data_out_file = os.environ.get("API_DATA_OUT_FILE","api_data.txt"),
     )
     
     if not settings.oauth_token:
@@ -987,6 +991,36 @@ def clear_dep_info_for_users(settings: "SettingParams"):
     print('Перемещение пользователей в департамент "Все" завершено.')
     return
 
+def generate_api360_hierarchy(settings: "SettingParams", out_to_file: bool = False, file_suffix: str = ""):
+    hierarchy = []
+    departments = generate_deps_list_from_api(settings)
+    departments.append({"id": 1, "path": "All", "mail": "" })
+    users = get_all_api360_users(settings, True)
+    if not users:
+        logger.error("List of users from Yandex 360 is empty. Exit.")
+        return []
+    for dep in departments:
+        if dep.get("mail"):
+            dep_mail = '~' + dep.get("mail")
+        else:
+            dep_mail = ''
+        hierarchy.append(f"{dep.get('id')};{dep.get('path')}{dep_mail}")
+        for user in users:
+            if user["departmentId"] == dep["id"]:
+                user_name = f'{user["name"]["last"]} {user["name"]["first"]} {user["name"]["middle"]}'
+                if user["aliases"]:
+                    user_aliases = ',' + ','.join(user["aliases"])
+                else:
+                    user_aliases = ''
+                hierarchy.append(f"{dep.get('id')};{dep.get('path')}{dep_mail}|{user['id']};{user_name}~{user['email']}{user_aliases}")
+
+    if out_to_file:
+        file_name = settings.api_data_out_file.split('.')[0] + '_' + file_suffix + '.' + settings.api_data_out_file.split('.')[1]
+        with open(file_name, 'w', encoding="utf-8") as f:
+            for item in hierarchy:
+                f.write(item + '\n')
+    return hierarchy
+
 
 if __name__ == "__main__":
     denv_path = os.path.join(os.path.dirname(__file__), '.env_ldap')
@@ -1004,7 +1038,7 @@ if __name__ == "__main__":
     settings = get_settings()
     
     if settings is None:
-        logger.error("Проверьте настройки в файле .env и попробуйте снова.")
+        logger.error("Проверьте настройки в файле .env_ldap и попробуйте снова.")
         sys.exit(EXIT_CODE)
 
     if settings.dry_run:
@@ -1027,7 +1061,8 @@ if __name__ == "__main__":
         if not check_similar_mails_in_hierarchy(hierarchy):
             #sys.exit(1)
             pass
-
+    
+    generate_api360_hierarchy(settings, out_to_file=True, file_suffix="start_state")
     #hierarchy = filter_empty_ad_deps(hierarchy)
     final_list = prepare_deps_list_from_ad_hab(settings, hierarchy)
     delete_deps_from_y360(settings, final_list, "same_email")
@@ -1038,7 +1073,7 @@ if __name__ == "__main__":
         if item['360id'] == 0:
             if not settings.dry_run:
                 logger.error('\n')
-                logger.error(f'Department {item["path"]} not saved in Yandex 360.')
+                logger.error(f"Department {item['path']} not saved in Yandex 360.")
                 exit_flag = True
     if exit_flag:
         logger.error('\n')
@@ -1058,7 +1093,9 @@ if __name__ == "__main__":
 
     assign_users_to_deps2(settings, created_deps, ad_users)
     delete_deps_from_y360(settings,final_list, "no_synced_from_ad")
-    delete_deps_with_no_users(settings)
+    #delete_deps_with_no_users(settings)
+
+    generate_api360_hierarchy(settings, out_to_file=True, file_suffix="end_state")
 
     logger.info('---------------End-----------------')
 
