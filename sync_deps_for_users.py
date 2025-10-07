@@ -107,7 +107,7 @@ def build_group_hierarchy(settings: "SettingParams"):
         name = item['cn'].value
 
     if len(item.entry_attributes_as_dict.get(settings.dep_external_id_attribute,'')) > 0:
-        external_id = item[settings.dep_external_id_attribute].value 
+        external_id = item[settings.dep_external_id_attribute].value.lower().strip() 
     else:
         external_id = ""
 
@@ -140,7 +140,7 @@ def build_group_hierarchy(settings: "SettingParams"):
 def build_hierarcy_recursive(conn, settings: "SettingParams", base, item, hierarchy, users):
 
     ldap_search_filter = f"(memberOf={utils.conv.escape_filter_chars(item['distinguishedName'].value)})"
-    previous_external_id = item[settings.dep_external_id_attribute].value
+    previous_external_id = item[settings.dep_external_id_attribute].value.lower().strip()
     logger.info(f'Trying to search members of group. LDAP filter: {ldap_search_filter}')
     conn.search(settings.ldap_base_dn, ldap_search_filter, search_scope=SUBTREE, attributes=settings.attrib_list)
     logger.info(f'Found {len(conn.entries)} records.')
@@ -153,7 +153,7 @@ def build_hierarcy_recursive(conn, settings: "SettingParams", base, item, hierar
                 else:
                     group_mail = ""
                 if len(item.entry_attributes_as_dict.get(settings.dep_external_id_attribute,'')) > 0:
-                    external_id = item[settings.dep_external_id_attribute].value
+                    external_id = item[settings.dep_external_id_attribute].value.lower().strip()
                 else:
                     external_id = ""
                 #group_mail = f"{item['sAMAccountName'].value}@{EMAIL_DOMAIN}"
