@@ -22,7 +22,9 @@ ALL_USERS_REFRESH_IN_MINUTES = 15
 USERS_PER_PAGE_FROM_API = 1000
 DEPARTMENTS_PER_PAGE_FROM_API = 100
 SENSITIVE_FIELDS = ['password', 'oauth_token', 'access_token', 'token']
+LDAP_PAGE_SIZE = 1000
 EXIT_CODE = 1
+
 
 logger = logging.getLogger("sync_deps")
 logger.setLevel(logging.DEBUG)
@@ -59,15 +61,33 @@ def build_group_hierarchy(settings: "SettingParams"):
     logger.info(f'Connected to LDAP server {settings.ldap_host}:{settings.ldap_port}')
 
     users = []
-    logger.info(f'Trying to search users. LDAP filter: {settings.ldap_search_filter}')
-    conn.search(settings.ldap_base_dn, settings.ldap_search_filter, search_scope=SUBTREE, attributes=settings.attrib_list)
-    if conn.last_error is not None:
-        logger.error('Can not connect to LDAP. Exit.')
-        #logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
-        return {}
+    # logger.info(f'Trying to search users. LDAP filter: {settings.ldap_search_filter}')
+    # conn.search(settings.ldap_base_dn, settings.ldap_search_filter, search_scope=SUBTREE, attributes=settings.attrib_list)
+    # if conn.last_error is not None:
+    #     logger.error('Can not connect to LDAP. Exit.')
+    #     #logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
+    #     return {}
+
+    ldap_results = []
+    cookie = None
+    while True:
+        conn.search(settings.ldap_base_dn, settings.ldap_search_filter, search_scope=SUBTREE, attributes=settings.attrib_list, paged_size=LDAP_PAGE_SIZE, paged_cookie=cookie)
+
+        if conn.last_error is not None:
+            logger.error('Can not connect to LDAP. Exit.')
+            logger.error(f"LDAP error: {conn.last_error}")
+            return {}
+        
+        ldap_results.extend(conn.entries)
+        
+        # Check if there is another page
+        cookie = conn.result.get('controls', {}).get('1.2.840.113556.1.4.319', {}).get('value', {}).get('cookie')
+        if not cookie:
+            break
+
     logger.info(f'Found {len(conn.entries)} records.')
     try:            
-        for item in conn.entries:
+        for item in ldap_results:
             entry = {}
             if item['objectCategory'].value.startswith('CN=Person'):
                 if len(item.entry_attributes_as_dict.get('mail','')) > 0:
@@ -91,16 +111,34 @@ def build_group_hierarchy(settings: "SettingParams"):
     hierarchy = []
     root_group_search_filter = f"(distinguishedName={settings.hab_root_group})"
     logger.info(f'Trying to search root group. LDAP filter: {root_group_search_filter}')
-    conn.search(settings.ldap_base_dn, root_group_search_filter, search_scope=SUBTREE, attributes=settings.attrib_list)
-    if conn.last_error is not None:
-        logger.error('Can not connect to LDAP. Exit.')
-        #logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
-        return []
-    if len(conn.entries) == 0:
+    # conn.search(settings.ldap_base_dn, root_group_search_filter, search_scope=SUBTREE, attributes=settings.attrib_list)
+    # if conn.last_error is not None:
+    #     logger.error('Can not connect to LDAP. Exit.')
+    #     #logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
+    #     return []
+
+    ldap_results = []
+    cookie = None
+    while True:
+        conn.search(settings.ldap_base_dn, settings.ldap_search_filter, search_scope=SUBTREE, attributes=settings.attrib_list, paged_size=LDAP_PAGE_SIZE, paged_cookie=cookie)
+
+        if conn.last_error is not None:
+            logger.error('Can not connect to LDAP. Exit.')
+            logger.error(f"LDAP error: {conn.last_error}")
+            return {}
+        
+        ldap_results.extend(conn.entries)
+        
+        # Check if there is another page
+        cookie = conn.result.get('controls', {}).get('1.2.840.113556.1.4.319', {}).get('value', {}).get('cookie')
+        if not cookie:
+            break
+
+    if len(ldap_results) == 0:
         logger.error('Can find root group. Exit.')
         return []
     
-    item = conn.entries[0]
+    item = ldap_results[0]
     if len(item.entry_attributes_as_dict.get(settings.dep_name_attribute,'')) > 0:
         name = item[settings.dep_name_attribute].value
     else:
@@ -142,10 +180,28 @@ def build_hierarcy_recursive(conn, settings: "SettingParams", base, item, hierar
     ldap_search_filter = f"(memberOf={utils.conv.escape_filter_chars(item['distinguishedName'].value)})"
     previous_external_id = item[settings.dep_external_id_attribute].value.lower().strip()
     logger.info(f'Trying to search members of group. LDAP filter: {ldap_search_filter}')
-    conn.search(settings.ldap_base_dn, ldap_search_filter, search_scope=SUBTREE, attributes=settings.attrib_list)
-    logger.info(f'Found {len(conn.entries)} records.')
+
+    #conn.search(settings.ldap_base_dn, ldap_search_filter, search_scope=SUBTREE, attributes=settings.attrib_list)
+    ldap_results = []
+    cookie = None
+    while True:
+        conn.search(settings.ldap_base_dn, settings.ldap_search_filter, search_scope=SUBTREE, attributes=settings.attrib_list, paged_size=LDAP_PAGE_SIZE, paged_cookie=cookie)
+
+        if conn.last_error is not None:
+            logger.error('Can not connect to LDAP. Exit.')
+            logger.error(f"LDAP error: {conn.last_error}")
+            return {}
+        
+        ldap_results.extend(conn.entries)
+        
+        # Check if there is another page
+        cookie = conn.result.get('controls', {}).get('1.2.840.113556.1.4.319', {}).get('value', {}).get('cookie')
+        if not cookie:
+            break
+
+    logger.info(f'Found {len(ldap_results)} records.')
     try:            
-        for item in conn.entries:            
+        for item in ldap_results:            
             if item['objectCategory'].value.startswith("CN=Group"):
                 sam_name = item['sAMAccountName'].value.lower().strip()
                 if len(item.entry_attributes_as_dict.get(settings.dep_mail_attribute,'')) > 0:
